@@ -48,7 +48,7 @@ String DATA_PATH = "/data/inverter/battery/";
 String ERRO_PATH = "/errors/";
 AsyncWebServer server(80);
 
-const String dataExample = "215.37#50.93#1242.45#24.87#472.55#37.00#21.00#60.00#20.00#35.00";
+// const String dataExample = "215.37#50.93#1242.45#24.87#472.55#37.00#21.00#60.00#20.00#35.00";
 
 const char* PARAM_INPUT_1 = "ssid";
 const char* PARAM_INPUT_2 = "password";
@@ -554,7 +554,7 @@ void setup() {
   // testSerial.setTimeout(100);
   WiFi.mode(WIFI_AP_STA);
   EEPROM.begin(512);
-  WiFi.softAP(WIFI_BROADCAST_SSID);
+  WiFi.softAP(WIFI_BROADCAST_SSID, "12345678", 6);
   pinMode(STM_READY, INPUT);
   pinMode(STM_START, OUTPUT);
   WiFi.persistent(true);
@@ -567,12 +567,12 @@ void setup() {
 
   server.on("/wifi", HTTP_POST, [](AsyncWebServerRequest *request){    
     if (request->hasParam(PARAM_INPUT_1) && request->hasParam(PARAM_INPUT_2)) {
-      isStartConnect = true;
-      WiFi.disconnect();
       param_ssid = request->getParam(PARAM_INPUT_1)->value();
       param_password = request->getParam(PARAM_INPUT_2)->value();
       uid = request->getParam(PARAM_INPUT_3)->value();
       Serial.println("params: " + param_ssid + " " + param_password + " " + uid);
+      isStartConnect = true;
+      WiFi.disconnect();
       request->send_P(200, "text/plain", connectSuccess().c_str());
       
     } else {
@@ -584,9 +584,13 @@ void setup() {
     if (WiFi.status() != WL_CONNECTED) {
       WiFi.reconnect();
     }
-    isStartChangeMode = true;
     
     request->send_P(200, "text/plain", String(statusWifi()).c_str());
+    
+    // Close WiFi AP to force client redirect
+    WiFi.mode(WIFI_STA);
+    delay(5000);
+    WiFi.mode(WIFI_AP_STA);
   });
 
   server.on("/mqtt-status", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -673,8 +677,8 @@ void loop() {
 
     previousMillis = currentMillis;    
     taskComplete = true;
-    // String res = testSerial.readString();
-    String res = dataExample; // For testing, replace with testSerial.readString();
+    String res = testSerial.readString();
+    // String res = dataExample; // For testing, replace with testSerial.readString();
     res.trim();
     Serial.println("Data: " + res);
     if (res.isEmpty()) {
@@ -773,7 +777,6 @@ void loop() {
 
   if (isStartChangeMode) {
     isStartChangeMode = false;
-    delay(1000);
     WiFi.mode(WIFI_STA);
     delay(3000);
     WiFi.mode(WIFI_AP_STA);
@@ -785,10 +788,6 @@ void loop() {
       connectToMqtt();
       previousMillisMqttReconnect = currentMillis;
     }
-  } else {
-    Serial.println("WiFi not connected, MQTT cannot connect");
-    isMqttConnected = false;
-    connectMqtt = 0;
   }
 
 }
