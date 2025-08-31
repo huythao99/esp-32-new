@@ -10,7 +10,7 @@
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
 
-#define WIFI_BROADCAST_SSID "GTIControl401"
+#define WIFI_BROADCAST_SSID "GTIControl404"
 
 #define KEY_SPLIT "&&&&"
 #define KEY_SPLIT_DATA "#"
@@ -72,33 +72,30 @@ unsigned long previousMillisMqttReconnect = 0;
 long double totalA = 0;
 long double totalA2 = 0;
 
-bool taskComplete = false;
 
 int countLCD = 0;
 
 String uid;
 
-bool taskCompleted = false;
 int connectMqtt = -1; // -1: pending; 0: failed; 1: success
 bool isMqttConnected = false;
 unsigned long lastMqttReconnectAttempt = 0;
 
 bool isStartRegisterDevice = false;
 
-bool isStartStreamCharge = false;
+bool isStartChangeModeWifi = false;
 
 bool dataChanged = false;
 String param_ssid;
 String param_password;
 
 bool isStartConnect = true;
-bool isStartChangeMode = false;
 bool isStartMqtt = false;
 
 const long interval = 3000; 
 const long intervalDigital = 1000;
 const long intervalWifi = 60000;
-const long intervalMqtt = 3000;
+const long intervalMqtt = 1000;
 const long intervalMqttReconnect = 10000;
 const long invertalSetting = 3000;
 const long intervalSchedule = 3000;
@@ -286,7 +283,6 @@ void parseScheduleData(const String& scheduleData) {
 }
 
 void readWifi() {
-  Serial.printf("Read wifi");
   String strText = readStringFromEEPROM(0); 
 
   if (strText.length() == 0 || strText.isEmpty()) {
@@ -314,9 +310,6 @@ void readWifi() {
 
 // MQTT connection function
 bool connectToMqtt() {
-    if (millis() - lastMqttReconnectAttempt < 5000) {
-        return false;
-    }
     
     lastMqttReconnectAttempt = millis();
     
@@ -373,6 +366,15 @@ int mqttStatus() {
 }
 
 
+// Function to clear all EEPROM
+void clearEEPROM() {
+  for (int i = 0; i < 512; i++) {
+    EEPROM.write(i, 0);
+  }
+  EEPROM.commit();
+  Serial.println("EEPROM cleared");
+}
+
 // Function to write a string to EEPROM
 void writeStringToEEPROM(int addr, const String &str) {
   int len = str.length();
@@ -411,6 +413,10 @@ void getAStorage() {
   String totalA2ByString = strText.substring(index_split + key_split.length());
   totalA = totalAByString.toDouble();
   totalA2 = totalA2ByString.toDouble();
+  Serial.print("total A Storage: ");
+  Serial.println(totalAByString);
+  Serial.print("total A2 Storage");
+  Serial.println(totalA2ByString);
 }
 
 // Function to get device settings from API
@@ -490,7 +496,8 @@ String getScheduleSettings(const String& deviceUid, const String& deviceSSID) {
         String value = doc["schedule"].as<String>();
         parseScheduleData(value);        
       } else {
-        Serial.println("Failed to parse schedule settings JSON");
+        Serial.println("Failed to parse schedule settings JSON, using last setup value if available");
+        testSerial.write(lastSetupValue.c_str());
       }
     }
   } else {
@@ -554,11 +561,12 @@ void setup() {
   // testSerial.setTimeout(100);
   WiFi.mode(WIFI_AP_STA);
   EEPROM.begin(512);
-  WiFi.softAP(WIFI_BROADCAST_SSID, "12345678", 6);
+  WiFi.softAP(WIFI_BROADCAST_SSID, "12345678");
   pinMode(STM_READY, INPUT);
   pinMode(STM_START, OUTPUT);
   WiFi.persistent(true);
   WiFi.setAutoReconnect(true);
+  // clearEEPROM();
   readWifi();
   getAStorage();
   
@@ -581,20 +589,22 @@ void setup() {
   });
 
   server.on("/wifi-status", HTTP_GET, [](AsyncWebServerRequest *request) {
+    Serial.println("Checking WiFi status...");
+    Serial.println("Current WiFi status: " + String(WiFi.status()));
     if (WiFi.status() != WL_CONNECTED) {
       WiFi.reconnect();
     }
     
     request->send_P(200, "text/plain", String(statusWifi()).c_str());
-    
-    // Close WiFi AP to force client redirect
-    WiFi.mode(WIFI_STA);
-    delay(5000);
-    WiFi.mode(WIFI_AP_STA);
   });
 
   server.on("/mqtt-status", HTTP_GET, [](AsyncWebServerRequest *request) {
     request->send_P(200, "text/plain", String(mqttStatus()).c_str());
+  });
+
+  server.on("/change-mode-wifi", HTTP_GET, [](AsyncWebServerRequest *request) {
+    isStartChangeModeWifi = true;
+    request->send_P(200, "text/plain", connectSuccess().c_str());
   });
 
   // start server
@@ -609,6 +619,18 @@ void loop() {
   // MQTT loop
   if (mqttClient.connected()) {
     mqttClient.loop();
+  }
+
+  if (isStartChangeModeWifi) {
+    Serial.println("Disconnecting all AP clients...");
+    WiFi.softAPdisconnect(true);  // Disconnect all clients and stop AP
+    delay(1000);
+    WiFi.mode(WIFI_STA);          // Station mode only (no AP)
+    delay(3000);
+    WiFi.softAP(WIFI_BROADCAST_SSID, "12345678", 6);  // Restart AP
+    WiFi.mode(WIFI_AP_STA);       // Back to AP+STA mode
+    Serial.println("AP restarted - mobile clients disconnected");
+    isStartChangeModeWifi = false;
   }
 
   // listenButtonEvent();
@@ -673,69 +695,69 @@ void loop() {
   }
 
   // check MQTT connection and publish data
-  if (currentMillis - previousMillis >= interval && isMqttConnected && !taskComplete) {
+  if (currentMillis - previousMillis >= interval && isMqttConnected) {
 
     previousMillis = currentMillis;    
-    taskComplete = true;
     String res = testSerial.readString();
     // String res = dataExample; // For testing, replace with testSerial.readString();
     res.trim();
     Serial.println("Data: " + res);
     if (res.isEmpty()) {
-      return;
-    }
-    int indexOf = res.indexOf("*");
+      Serial.println("No data received from serial");
+    } else {
+      int indexOf = res.indexOf("*");
 
-    res = res.substring(0, indexOf);
+          res = res.substring(0, indexOf);
 
-    String currentUid = getUid();
-    Serial.println("Current UID: " + currentUid);
-    
-    long double pAfter = 0;
-    long double p2After = 0;
-    
-    // Parse the string to find 9th and 10th values
-    int startIndex = 0;
-    int tokenCount = 0;
-    
-    while (startIndex < res.length()) {
-        int endIndex = res.indexOf('#', startIndex);
-        if (endIndex == -1) endIndex = res.length();
-        
-        tokenCount++;
-        String token = res.substring(startIndex, endIndex);
-        
-        if (tokenCount == 9) {
-            pAfter = fabs(token.toDouble());
-        } else if (tokenCount == 10) {
-            p2After = fabs(token.toDouble());
-            break; // Found both values, exit loop
-        }
-        
-        startIndex = endIndex + 1;
-    }
+          String currentUid = getUid();
+          Serial.println("Current UID: " + currentUid);
+          
+          long double pAfter = 0;
+          long double p2After = 0;
+          
+          // Parse the string to find 9th and 10th values
+          int startIndex = 0;
+          int tokenCount = 0;
+          
+          while (startIndex < res.length()) {
+              int endIndex = res.indexOf('#', startIndex);
+              if (endIndex == -1) endIndex = res.length();
+              
+              tokenCount++;
+              String token = res.substring(startIndex, endIndex);
+              
+              if (tokenCount == 9) {
+                  pAfter = fabs(token.toDouble());
+              } else if (tokenCount == 10) {
+                  p2After = fabs(token.toDouble());
+                  break; // Found both values, exit loop
+              }
+              
+              startIndex = endIndex + 1;
+          }
 
-    long double increament1 = pAfter;
-    long double incremeant2 = p2After;
+          long double increament1 = pAfter;
+          long double incremeant2 = p2After;
+              
+          // Use higher precision calculation to avoid floating point errors    
+          totalA = totalA + increament1 / 1000000.0;
+          totalA2 = totalA2 + incremeant2 / 1000000.0;
         
-    // Use higher precision calculation to avoid floating point errors    
-    totalA = totalA + increament1 / 1000000.0;
-    totalA2 = totalA2 + incremeant2 / 1000000.0;
-  
-    // Publish data via MQTT
-    String jsonString = "{\"value\":\"" + res + "\",\"totalA2Capacity\":\"" + String((double)totalA2) + "\",\"totalACapacity\":\"" + String((double)totalA)  + "\"}";
-    if (!MQTT_TOPIC_DATA.isEmpty()) {
-      String signedJsonString = createSignedMessage(jsonString);
-      bool dataPublished = mqttClient.publish(MQTT_TOPIC_DATA.c_str(), signedJsonString.c_str());
-      taskComplete = false;
-      Serial.println("Data published: " + String(dataPublished));
-      if (dataPublished) {
-        Serial.println("Data published successfully");
-      }
+          // Publish data via MQTT
+          String jsonString = "{\"value\":\"" + res + "\",\"totalA2Capacity\":\"" + String((double)totalA2) + "\",\"totalACapacity\":\"" + String((double)totalA)  + "\"}";
+          if (!MQTT_TOPIC_DATA.isEmpty()) {
+            String signedJsonString = createSignedMessage(jsonString);
+            bool dataPublished = mqttClient.publish(MQTT_TOPIC_DATA.c_str(), signedJsonString.c_str());
+            Serial.println("Data published: " + String(dataPublished));
+            if (dataPublished) {
+              Serial.println("Data published successfully");
+            }
+          }
     }
+    
   }
 
-  // WiFi connection monitoring and reconnection
+  // // WiFi connection monitoring and reconnection
   if ((WiFi.status() != WL_CONNECTED) && (currentMillis - previousMillisWifi >= intervalWifi)) {
     Serial.printf("[%lu] WiFi disconnected (status: %d), attempting reconnection...\n", millis(), WiFi.status());
     WiFi.reconnect();
@@ -746,46 +768,54 @@ void loop() {
     connectMqtt = 0;
   }
 
-  if (isMqttConnected && (currentMillis - previousMillisMqtt >= intervalMqtt)) {
+  if ((currentMillis - previousMillisMqtt >= intervalMqtt)) {
+    Serial.println("MQTT interval check passed, time since last: " + String(currentMillis - previousMillisMqtt));
     previousMillisMqtt = currentMillis;
-    struct tm timeinfo;
-    if(!getLocalTime(&timeinfo)){
-      Serial.println("Failed to obtain time");
-      return;
-    }
-    
-    // Publish status update via MQTT
-    char timeStringBuff[50];
-    strftime(timeStringBuff, sizeof(timeStringBuff), "%Y-%m-%dT%H:%M:%SZ", &timeinfo);
-    Serial.println(timeStringBuff);
-    
-    if (!MQTT_TOPIC_STATUS.isEmpty()) {
-      String statusMsg = "{\"updatedAt\":\"" + String(timeStringBuff) + "\",\"status\":\"online\"}";
-      String signedStatusMsg = createSignedMessage(statusMsg);
-      if (mqttClient.connected()) {
-        bool statusPublished = mqttClient.publish(MQTT_TOPIC_STATUS.c_str(), signedStatusMsg.c_str());
-        if (statusPublished) {
-          Serial.println("Status published successfully " + MQTT_TOPIC_STATUS);
-        } else {
-          Serial.println("Status published unsuccessfully");
-        }
-      } else {
-        Serial.println("MQTT not connected, cannot publish status");
+    if (isMqttConnected && mqttClient.connected()) {
+      Serial.println("Publishing status update...");
+      struct tm timeinfo;
+      if(!getLocalTime(&timeinfo)){
+        Serial.println("Failed to obtain time");
+        return;
       }
+      Serial.println("Publishing status update... 1");
+
+      // Publish status update via MQTT
+      char timeStringBuff[50];
+      strftime(timeStringBuff, sizeof(timeStringBuff), "%Y-%m-%dT%H:%M:%SZ", &timeinfo);
+      Serial.println(timeStringBuff);
+      
+      if (!MQTT_TOPIC_STATUS.isEmpty()) {
+        String statusMsg = "{\"updatedAt\":\"" + String(timeStringBuff) + "\",\"status\":\"online\"}";
+        String signedStatusMsg = createSignedMessage(statusMsg);
+        if (mqttClient.connected()) {
+          bool statusPublished = mqttClient.publish(MQTT_TOPIC_STATUS.c_str(), signedStatusMsg.c_str());
+          if (statusPublished) {
+            Serial.println("Status published successfully " + MQTT_TOPIC_STATUS);
+          } else {
+            Serial.println("Status published unsuccessfully");
+          }
+        } else {
+          Serial.println("MQTT not connected, cannot publish status");
+        }
+      }
+    } else {
+      Serial.println("MQTT not connected, skipping status publish. isMqttConnected: " + String(isMqttConnected) + ", mqttClient.connected(): " + String(mqttClient.connected()));
+      // Don't update previousMillisMqtt here so we keep trying
     }
+    
   }
 
-  if (isStartChangeMode) {
-    isStartChangeMode = false;
-    WiFi.mode(WIFI_STA);
-    delay(3000);
-    WiFi.mode(WIFI_AP_STA);
-  }
   // Ensure MQTT connection is maintained - check WiFi first, then connect MQTT with interval
   if (WiFi.status() == WL_CONNECTED) {
     if (!mqttClient.connected() && (currentMillis - previousMillisMqttReconnect >= intervalMqttReconnect)) {
       Serial.println("WiFi connected but MQTT disconnected, attempting reconnection...");
-      connectToMqtt();
+      isMqttConnected = false; // Reset flag before attempting reconnection
+      if (connectToMqtt()) {
+        Serial.println("MQTT reconnection successful");
+      } else {
+        Serial.println("MQTT reconnection failed");
+      }
       previousMillisMqttReconnect = currentMillis;
     }
   }
