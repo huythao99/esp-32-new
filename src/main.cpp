@@ -10,7 +10,7 @@
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
 
-#define WIFI_BROADCAST_SSID "GTIControl404"
+#define WIFI_BROADCAST_SSID "GTIControl405"
 
 #define KEY_SPLIT "&&&&"
 #define KEY_SPLIT_DATA "#"
@@ -103,6 +103,9 @@ const long intervalSchedule = 3000;
 String valueSetup = "";
 
 bool isLow = false;
+
+HTTPClient http;
+
 
 // Structure to hold schedule data
 struct ScheduleItem {
@@ -426,7 +429,7 @@ String getDeviceSettings(const String& deviceUid, const String& deviceSSID) {
     return "";
   }
   
-  HTTPClient http;
+  // HTTPClient http;
   String url = "https://giabao-inverter.com/api/inverter-setting/data/" + deviceUid + "/" + deviceSSID;
   
   Serial.println("Fetching device settings from: " + url);
@@ -470,7 +473,7 @@ String getScheduleSettings(const String& deviceUid, const String& deviceSSID) {
     return "";
   }
   
-  HTTPClient http;
+  // HTTPClient http;
   String url = "https://giabao-inverter.com/api/inverter-schedule/data/" + deviceUid + "/" + deviceSSID;
   
   Serial.println("Fetching schedule settings from: " + url);
@@ -515,7 +518,7 @@ bool registerDevice(const String& deviceId, const String& deviceName, const Stri
     return false;
   }
   
-  HTTPClient http;
+  // HTTPClient http;
   String url = "https://giabao-inverter.com/api/inverter-device/data";
   
   Serial.println("Registering device at: " + url);
@@ -561,7 +564,7 @@ void setup() {
   // testSerial.setTimeout(100);
   WiFi.mode(WIFI_AP_STA);
   EEPROM.begin(512);
-  WiFi.softAP(WIFI_BROADCAST_SSID, "12345678");
+  WiFi.softAP(WIFI_BROADCAST_SSID, "", 6);
   pinMode(STM_READY, INPUT);
   pinMode(STM_START, OUTPUT);
   WiFi.persistent(true);
@@ -569,6 +572,7 @@ void setup() {
   // clearEEPROM();
   readWifi();
   getAStorage();
+  http.setReuse(true);
   
   // Initialize MQTT
   mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
