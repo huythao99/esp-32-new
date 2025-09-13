@@ -10,7 +10,7 @@
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
 
-#define WIFI_BROADCAST_SSID "GTIControl405"
+#define WIFI_BROADCAST_SSID "GTIControl407"
 
 #define KEY_SPLIT "&&&&"
 #define KEY_SPLIT_DATA "#"
