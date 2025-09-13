@@ -9,6 +9,8 @@
 #include "mbedtls/md.h"
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
+#include <Preferences.h>
+#include <HTTPUpdate.h>
 
 #define WIFI_BROADCAST_SSID "GTIControl405"
 
@@ -32,6 +34,9 @@
 
 EspSoftwareSerial::UART testSerial;
 
+// Preferences instance
+Preferences preferences;
+
 // MQTT client
 WiFiClient mqttWifiClient;
 PubSubClient mqttClient(mqttWifiClient);
@@ -41,6 +46,8 @@ String MQTT_TOPIC_DATA;
 String MQTT_TOPIC_SETUP;
 String MQTT_TOPIC_SCHEDULE;
 String MQTT_TOPIC_STATUS;
+String MQTT_TOPIC_FIRMWARE;
+String MQTT_TOPIC_OTA_STATUS;
 
 
 String DEVICES_PATH = "/devices/inverter/";
@@ -76,6 +83,8 @@ long double totalA2 = 0;
 int countLCD = 0;
 
 String uid;
+String wifiBroadcastSSID; // Variable to store SSID from Preferences
+String currentFirmwareVersion; // Variable to store current firmware version
 
 int connectMqtt = -1; // -1: pending; 0: failed; 1: success
 bool isMqttConnected = false;
@@ -330,17 +339,20 @@ bool connectToMqtt() {
         // Subscribe to topics
         String currentUid = getUid();
         if (!currentUid.isEmpty()) {
-            MQTT_TOPIC_SETUP = "inverter/" + currentUid + "/" + WIFI_BROADCAST_SSID + "/setup/value";
-            MQTT_TOPIC_SCHEDULE = "inverter/" + currentUid + "/" + WIFI_BROADCAST_SSID + "/schedule/value";
-            MQTT_TOPIC_DATA = "inverter/" + currentUid + "/" + WIFI_BROADCAST_SSID + "/data";
-            MQTT_TOPIC_STATUS = "inverter/" + currentUid + "/" + WIFI_BROADCAST_SSID + "/status";
+            MQTT_TOPIC_SETUP = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/setup/value";
+            MQTT_TOPIC_SCHEDULE = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/schedule/value";
+            MQTT_TOPIC_DATA = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/data";
+            MQTT_TOPIC_STATUS = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/status";
+            MQTT_TOPIC_FIRMWARE = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/firmware/update";
+            MQTT_TOPIC_OTA_STATUS = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/ota/status";
             
             mqttClient.subscribe(MQTT_TOPIC_SETUP.c_str());
             mqttClient.subscribe(MQTT_TOPIC_SCHEDULE.c_str());
             mqttClient.subscribe(MQTT_TOPIC_STATUS.c_str());
             mqttClient.subscribe(MQTT_TOPIC_DATA.c_str());
+            mqttClient.subscribe(MQTT_TOPIC_FIRMWARE.c_str());
 
-            Serial.println("MQTT subscribed to topics");
+            Serial.println("MQTT subscribed to topics including firmware update");
         }
         return true;
     } else {
@@ -421,6 +433,194 @@ void getAStorage() {
   Serial.print("total A2 Storage");
   Serial.println(totalA2ByString);
 }
+
+void saveWifiBroadcastSSID(const String& ssid) {
+  preferences.begin("wifi_config", false);
+  preferences.putString("broadcast_ssid", ssid);
+  preferences.end();
+  Serial.println("WIFI_BROADCAST_SSID saved: " + ssid);
+}
+
+String loadWifiBroadcastSSID() {
+  preferences.begin("wifi_config", true);
+  String ssid = preferences.getString("broadcast_ssid", WIFI_BROADCAST_SSID);
+  preferences.end();
+  Serial.println("WIFI_BROADCAST_SSID loaded: " + ssid);
+  return ssid;
+}
+
+void publishOTAStatus(const String& status, const String& message = "", int progress = -1) {
+  if (!mqttClient.connected() || MQTT_TOPIC_OTA_STATUS.isEmpty()) {
+    return;
+  }
+  
+  String jsonStatus = "{\"status\":\"" + status + "\"";
+  
+  if (!message.isEmpty()) {
+    jsonStatus += ",\"message\":\"" + message + "\"";
+  }
+  
+  if (progress >= 0) {
+    jsonStatus += ",\"progress\":" + String(progress);
+  }
+  
+  if (!currentFirmwareVersion.isEmpty()) {
+    jsonStatus += ",\"currentVersion\":\"" + currentFirmwareVersion + "\"";
+  }
+  
+  // Add timestamp
+  struct tm timeinfo;
+  if(getLocalTime(&timeinfo)) {
+    char timeStr[30];
+    strftime(timeStr, sizeof(timeStr), "%Y-%m-%dT%H:%M:%SZ", &timeinfo);
+    jsonStatus += ",\"timestamp\":\"" + String(timeStr) + "\"";
+  }
+  
+  jsonStatus += "}";
+  
+  bool published = mqttClient.publish(MQTT_TOPIC_OTA_STATUS.c_str(), jsonStatus.c_str());
+  Serial.println("OTA Status published: " + jsonStatus + " (success: " + String(published) + ")");
+}
+
+String getFirmwareS3URL(const String& version = "latest") {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("FOTA: WiFi not connected, cannot get firmware URL");
+    return "";
+  }
+  
+  String currentUid = getUid();
+  if (currentUid.isEmpty()) {
+    Serial.println("FOTA: UID is empty, cannot get firmware URL");
+    return "";
+  }
+  
+  String url = "https://giabao-inverter.com/api/firmware";
+  url += "?deviceId=" + wifiBroadcastSSID;
+  
+  Serial.println("FOTA: Requesting firmware URL from: " + url);
+  
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+  
+  int httpResponseCode = http.GET();
+  String response = "";
+  String s3URL = "";
+  
+  if (httpResponseCode > 0) {
+    response = http.getString();
+    Serial.printf("FOTA: API response code: %d\n", httpResponseCode);
+    Serial.println("FOTA: API response: " + response);
+    
+    if (httpResponseCode == 200) {
+      JsonDocument doc;
+      DeserializationError error = deserializeJson(doc, response);
+      
+      if (!error) {
+        if (doc.containsKey("url")) {
+          s3URL = doc["url"].as<String>();
+          Serial.println("FOTA: S3 URL extracted: " + s3URL);
+        } else if (doc.containsKey("downloadUrl")) {
+          s3URL = doc["downloadUrl"].as<String>();
+          Serial.println("FOTA: S3 URL extracted: " + s3URL);
+        } else {
+          Serial.println("FOTA: No 'url' or 'downloadUrl' field in API response");
+        }
+      } else {
+        Serial.println("FOTA: Failed to parse firmware API JSON response");
+      }
+    }
+  } else {
+    Serial.printf("FOTA: Failed to get firmware URL, HTTP error: %d\n", httpResponseCode);
+  }
+  
+  http.end();
+  return s3URL;
+}
+
+bool performFOTAUpdate(const String& firmwareURL) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("FOTA: WiFi not connected");
+    return false;
+  }
+  
+  Serial.println("FOTA: Starting firmware update from: " + firmwareURL);
+  
+  HTTPUpdate httpUpdate;
+  httpUpdate.onStart([]() {
+    Serial.println("FOTA: Update started");
+    publishOTAStatus("installing", "Firmware download completed, installing...", 0);
+  });
+  httpUpdate.onEnd([]() {
+    Serial.println("FOTA: Update finished");
+    publishOTAStatus("installing", "Firmware installation completed", 100);
+  });
+  httpUpdate.onProgress([](int cur, int total) {
+    int progress = (cur * 100) / total;
+    Serial.printf("FOTA: Progress: %d/%d bytes (%d%%)\n", cur, total, progress);
+    
+    // Publish progress every 10%
+    static int lastProgress = -1;
+    if (progress >= lastProgress + 10) {
+      publishOTAStatus("downloading", "Downloading firmware", progress);
+      lastProgress = progress;
+    }
+  });
+  httpUpdate.onError([](int err) {
+    Serial.printf("FOTA: Update error: %d\n", err);
+    publishOTAStatus("failed", "Firmware update error: " + String(err));
+  });
+  
+  WiFiClient client;
+  t_httpUpdate_return ret = httpUpdate.update(client, firmwareURL);
+  
+  switch (ret) {
+    case HTTP_UPDATE_FAILED:
+      Serial.printf("FOTA: Update failed. Error (%d): %s\n", httpUpdate.getLastError(), httpUpdate.getLastErrorString().c_str());
+      return false;
+      
+    case HTTP_UPDATE_NO_UPDATES:
+      Serial.println("FOTA: No update available");
+      return false;
+      
+    case HTTP_UPDATE_OK:
+      Serial.println("FOTA: Update successful, rebooting...");
+      return true;
+      
+    default:
+      Serial.println("FOTA: Unknown update result");
+      return false;
+  }
+}
+
+
+void handleFirmwareUpdate() {
+  Serial.println("FOTA: Starting firmware update process...");
+  
+  // Publish starting status
+  publishOTAStatus("starting", "Requesting firmware URL from server");
+  
+  String s3URL = getFirmwareS3URL();
+  
+  if (s3URL.isEmpty()) {
+    Serial.println("FOTA: Failed to get S3 URL, aborting update");
+    publishOTAStatus("failed", "Failed to get firmware URL from server");
+    return;
+  }
+  
+  // Publish downloading status
+  publishOTAStatus("downloading", "Starting firmware download");
+  
+  bool updateResult = performFOTAUpdate(s3URL);
+  
+  if (updateResult) {
+    Serial.println("FOTA: Firmware version updated to: " + currentFirmwareVersion);
+    publishOTAStatus("success", "Firmware update completed successfully, rebooting...");
+  } else {
+    Serial.println("FOTA: Firmware update failed");
+    publishOTAStatus("failed", "Firmware download or installation failed");
+  }
+}
+
 
 // Function to get device settings from API
 String getDeviceSettings(const String& deviceUid, const String& deviceSSID) {
@@ -564,7 +764,14 @@ void setup() {
   // testSerial.setTimeout(100);
   WiFi.mode(WIFI_AP_STA);
   EEPROM.begin(512);
-  WiFi.softAP(WIFI_BROADCAST_SSID, "", 6);
+  
+  // Load WIFI_BROADCAST_SSID from Preferences
+  wifiBroadcastSSID = loadWifiBroadcastSSID();
+  
+  // Initialize firmware version
+  currentFirmwareVersion = "1.0.0"; // Default version
+  
+  WiFi.softAP(wifiBroadcastSSID.c_str(), "", 6);
   pinMode(STM_READY, INPUT);
   pinMode(STM_START, OUTPUT);
   WiFi.persistent(true);
@@ -574,8 +781,25 @@ void setup() {
   getAStorage();
   http.setReuse(true);
   
-  // Initialize MQTT
+  // Initialize MQTTn
   mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
+  mqttClient.setCallback([](char* topic, byte* payload, unsigned int length) {
+    String message = "";
+    for (int i = 0; i < length; i++) {
+      message += (char)payload[i];
+    }
+    
+    String topicStr = String(topic);
+    Serial.println("MQTT message received on topic: " + topicStr);
+    Serial.println("Message: " + message);
+    
+    // Handle firmware update topic
+    if (topicStr == MQTT_TOPIC_FIRMWARE) {
+      Serial.println("FOTA: Firmware update requested via MQTT");
+      
+      handleFirmwareUpdate();
+    }
+  });
 
   server.on("/wifi", HTTP_POST, [](AsyncWebServerRequest *request){    
     if (request->hasParam(PARAM_INPUT_1) && request->hasParam(PARAM_INPUT_2)) {
@@ -631,7 +855,7 @@ void loop() {
     delay(1000);
     WiFi.mode(WIFI_STA);          // Station mode only (no AP)
     delay(3000);
-    WiFi.softAP(WIFI_BROADCAST_SSID, "12345678", 6);  // Restart AP
+    WiFi.softAP(wifiBroadcastSSID.c_str(), "12345678", 6);  // Restart AP
     WiFi.mode(WIFI_AP_STA);       // Back to AP+STA mode
     Serial.println("AP restarted - mobile clients disconnected");
     isStartChangeModeWifi = false;
@@ -673,7 +897,7 @@ void loop() {
     if (!currentUid.isEmpty()) {
       // Register device via API first
       Serial.println("Registering device via API...");
-      bool apiRegistered = registerDevice(WIFI_BROADCAST_SSID, WIFI_BROADCAST_SSID, currentUid);
+      bool apiRegistered = registerDevice(wifiBroadcastSSID, wifiBroadcastSSID, currentUid);
       
       if (apiRegistered) {
         Serial.println("Device registered via API successfully");
@@ -690,12 +914,12 @@ void loop() {
 
   if (currentMillis - previousMillisSetting >= invertalSetting) {
     previousMillisSetting = currentMillis;
-    getDeviceSettings(getUid(), WIFI_BROADCAST_SSID);
+    getDeviceSettings(getUid(), wifiBroadcastSSID);
   }
 
   if (currentMillis - previousMillisSchedule >= intervalSchedule) {
     previousMillisSchedule = currentMillis;
-    getScheduleSettings(getUid(), WIFI_BROADCAST_SSID);
+    getScheduleSettings(getUid(), wifiBroadcastSSID);
   }
 
   // check MQTT connection and publish data
