@@ -84,7 +84,7 @@ int countLCD = 0;
 
 String uid;
 String wifiBroadcastSSID; // Variable to store SSID from Preferences
-String currentFirmwareVersion = "1.0.0"; // Variable to store current firmware version
+String currentFirmwareVersion = "1.0.1"; // Variable to store current firmware version
 
 int connectMqtt = -1; // -1: pending; 0: failed; 1: success
 bool isMqttConnected = false;
@@ -789,11 +789,6 @@ void setup() {
     
     // Handle firmware update topic
     if (topicStr == MQTT_TOPIC_FIRMWARE) {
-      Serial.println("MQTT: Firmware update request received");
-      Serial.print("Topic: ");
-      Serial.println(topicStr);
-      Serial.print("Message: ");
-      Serial.println(message);
       handleFirmwareUpdate();
     }
   });
@@ -840,8 +835,9 @@ void loop() {
   unsigned long currentMillis = millis();
 
   if (!isUpdateVersion) {
-    if (WiFi.status() == WL_CONNECTED) {
+    if (WiFi.status() == WL_CONNECTED && isMqttConnected) {
       bool res =  updateFirmwareVersion(currentFirmwareVersion);
+      publishOTAStatus("installing", "Firmware installation completed", 100);
       if (res) {
         isUpdateVersion = true;
       }
