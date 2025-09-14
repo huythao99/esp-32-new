@@ -12,7 +12,7 @@
 #include <Preferences.h>
 #include <HTTPUpdate.h>
 
-#define WIFI_BROADCAST_SSID "GTIControl415"
+#define WIFI_BROADCAST_SSID "GTIControl407"
 
 #define KEY_SPLIT "&&&&"
 #define KEY_SPLIT_DATA "#"
