@@ -12,7 +12,7 @@
 #include <Preferences.h>
 #include <HTTPUpdate.h>
 
-#define WIFI_BROADCAST_SSID "GTIControl407"
+#define WIFI_BROADCAST_SSID "GTIControl550"
 
 #define KEY_SPLIT "&&&&"
 #define KEY_SPLIT_DATA "#"
@@ -382,26 +382,6 @@ void writeInfo(String ssid, String password, String userid) {
   content = content + userid;
   writeStringToEEPROM(0, content);
 
-}
-
-void writeAStorage(double totalA, double totalA2) {
-  String content = String(totalA) + KEY_SPLIT;
-  content = content + String(totalA2);
-  writeStringToEEPROM(100, content);
-}
-
-void getAStorage() {
-  String strText = readStringFromEEPROM(100); 
-
-  if (strText.length() == 0 || strText.isEmpty()) {
-    return;
-  }
-  String key_split = '\0' + KEY_SPLIT;
-  int index_split = strText.indexOf(key_split);
-  String totalAByString = strText.substring(0, index_split);
-  String totalA2ByString = strText.substring(index_split + key_split.length());
-  totalA = totalAByString.toDouble();
-  totalA2 = totalA2ByString.toDouble();
 }
 
 void saveWifiBroadcastSSID(const String& ssid) {
@@ -774,7 +754,6 @@ void setup() {
   WiFi.setAutoReconnect(true);
   // clearEEPROM();
   readWifi();
-  getAStorage();
   http.setReuse(true);
   
   // Initialize MQTTn
@@ -895,10 +874,6 @@ void loop() {
       }
     }
     isStartRegisterDevice = false;
-  }
-
-  if (currentMillis - previousMillisStorage >= 1000 * 60 * 60) {
-    writeAStorage(totalA, totalA2);
   }
 
   if (currentMillis - previousMillisSetting >= invertalSetting) {
