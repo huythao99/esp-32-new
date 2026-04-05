@@ -12,7 +12,7 @@
 #include <Preferences.h>
 #include <HTTPUpdate.h>
 
-#define WIFI_BROADCAST_SSID "GTIControl550"
+#define WIFI_BROADCAST_SSID "GTIControl855"
 
 #define KEY_SPLIT "&&&&"
 #define KEY_SPLIT_DATA "#"
@@ -84,7 +84,7 @@ int countLCD = 0;
 
 String uid;
 String wifiBroadcastSSID; // Variable to store SSID from Preferences
-String currentFirmwareVersion = "1.0.0"; // Variable to store current firmware version
+String currentFirmwareVersion = "1.0.2"; // Variable to store current firmware version
 
 int connectMqtt = -1; // -1: pending; 0: failed; 1: success
 bool isMqttConnected = false;
@@ -130,15 +130,15 @@ ScheduleItem schedules[3]; // Array to hold up to 3 schedule items
 int scheduleCount = 0;
 
 String readStringFromEEPROM(int addr) {
-  char data[100]; // Adjust size as needed
+  char data[150]; // Increased size for UTF-8 Vietnamese strings
   int len = 0;
   unsigned char k;
   k = EEPROM.read(addr);
-  while (k != '\0' && len < sizeof(data) - 1 && k <= 127 && k >= 32) {
+  // Remove ASCII filter to allow UTF-8 multibyte characters (Vietnamese)
+  while (k != '\0' && len < sizeof(data) - 1) {
     data[len] = k;
     len++;
     k = EEPROM.read(addr + len);
-
   }
   data[len] = '\0';
   return String(data);
@@ -148,12 +148,13 @@ String getUid() {
   if (uid.isEmpty() == false) {
     return uid;
   }
-  String strText = readStringFromEEPROM(0); 
+  String strText = readStringFromEEPROM(0);
 
   if (strText.length() == 0 || strText.isEmpty()) {
     return "";
   }
-  String key_split = '\0' + KEY_SPLIT;
+
+  String key_split = KEY_SPLIT;
   int index_split = strText.indexOf(key_split);
   param_ssid = strText.substring(0, index_split);
   strText.replace(param_ssid + key_split, "");
@@ -182,6 +183,22 @@ String convertSetupValue(const String& input) {
 }
 
 String lastSetupValue = ""; // Global variable to store the last setup value
+
+// Save setting value to Preferences (NVS - better wear-leveling than EEPROM)
+void saveSettingToStorage(const String& value) {
+  if (value.isEmpty()) return;
+  preferences.begin("device_setting", false);
+  preferences.putString("setup_value", value);
+  preferences.end();
+}
+
+// Load setting value from Preferences
+String loadSettingFromStorage() {
+  preferences.begin("device_setting", true);
+  String value = preferences.getString("setup_value", "");
+  preferences.end();
+  return value;
+}
 
 
 String createSignedMessage(const String& payload) {
@@ -281,38 +298,33 @@ void parseScheduleData(const String& scheduleData) {
 }
 
 void readWifi() {
-  String strText = readStringFromEEPROM(0); 
+  String strText = readStringFromEEPROM(0);
 
   if (strText.length() == 0 || strText.isEmpty()) {
     return;
   }
-  String key_split = '\0' + KEY_SPLIT;
+
+  String key_split = KEY_SPLIT;
   int index_split = strText.indexOf(key_split);
   param_ssid = strText.substring(0, index_split);
-    // param_ssid = "10S05-Bedroom";
   strText.replace(param_ssid + key_split, "");
   index_split = strText.indexOf(key_split);
   param_password = strText.substring(0, index_split);
-    // param_password = "123456789";
   strText.replace(param_password + key_split, "");
   uid = strText;
-  // uid = "Y8Lg4tiveSWmnkrzRqo98ngpTwH3";
   isStartConnect = true;
 }
 
 // MQTT connection function
 bool connectToMqtt() {
-    
     lastMqttReconnectAttempt = millis();
-    
-    
+
     String clientId = "esp32-" + WiFi.macAddress();
-    
-    
+
     if (mqttClient.connect(clientId.c_str(), MQTT_USERNAME, MQTT_PASSWORD)) {
         isMqttConnected = true;
         connectMqtt = 1;
-        
+
         // Subscribe to topics
         String currentUid = getUid();
         if (!currentUid.isEmpty()) {
@@ -322,13 +334,12 @@ bool connectToMqtt() {
             MQTT_TOPIC_STATUS = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/status";
             MQTT_TOPIC_FIRMWARE = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/firmware/update";
             MQTT_TOPIC_OTA_STATUS = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/ota/status";
-            
+
             mqttClient.subscribe(MQTT_TOPIC_SETUP.c_str());
             mqttClient.subscribe(MQTT_TOPIC_SCHEDULE.c_str());
             mqttClient.subscribe(MQTT_TOPIC_STATUS.c_str());
             mqttClient.subscribe(MQTT_TOPIC_DATA.c_str());
             mqttClient.subscribe(MQTT_TOPIC_FIRMWARE.c_str());
-
         }
         return true;
     } else {
@@ -371,7 +382,6 @@ void writeStringToEEPROM(int addr, const String &str) {
     EEPROM.write(addr + i, str[i]);
   }
   EEPROM.write(addr + len, '\0'); // Null-terminate the string
-  // EEPROM.writeString(addr, str);
   EEPROM.commit();
 }
 
@@ -381,7 +391,6 @@ void writeInfo(String ssid, String password, String userid) {
   content = content + KEY_SPLIT;
   content = content + userid;
   writeStringToEEPROM(0, content);
-
 }
 
 void saveWifiBroadcastSSID(const String& ssid) {
@@ -608,37 +617,59 @@ void handleFirmwareUpdate() {
 // Function to get device settings from API
 String getDeviceSettings(const String& deviceUid, const String& deviceSSID) {
   if (WiFi.status() != WL_CONNECTED) {
+    // Load from storage if WiFi not connected
+    if (lastSetupValue.isEmpty()) {
+      lastSetupValue = loadSettingFromStorage();
+    }
+    // Send stored value to STM32 even when offline
+    if (!lastSetupValue.isEmpty()) {
+      testSerial.write(lastSetupValue.c_str());
+    }
     return "";
   }
-  
+
   // HTTPClient http;
   String url = "https://giabao-inverter.com/api/inverter-setting/data/" + deviceUid + "/" + deviceSSID;
-  
-  
+
+
   http.begin(url);
   http.addHeader("Content-Type", "application/json");
-  
+
   int httpResponseCode = http.GET();
   String response = "";
-  
+
   if (httpResponseCode > 0) {
     response = http.getString();
-    
+
     if (httpResponseCode == 200) {
       // Parse the JSON response to extract settings
       JsonDocument doc;
       DeserializationError error = deserializeJson(doc, response);
-      
+
       if (!error) {
         // Extract settings values if they exist
         String value = doc["value"].as<String>();
-        lastSetupValue = convertSetupValue(value);
+        String newSetupValue = convertSetupValue(value);
+
+        // Save to storage only if value has changed
+        if (!newSetupValue.isEmpty() && newSetupValue != lastSetupValue) {
+          saveSettingToStorage(newSetupValue);
+          lastSetupValue = newSetupValue;
+        }
       } else {
       }
     }
   } else {
+    // Server request failed - load from storage as fallback
+    if (lastSetupValue.isEmpty()) {
+      lastSetupValue = loadSettingFromStorage();
+    }
+    // Send stored value to STM32 when server fails
+    if (!lastSetupValue.isEmpty()) {
+      testSerial.write(lastSetupValue.c_str());
+    }
   }
-  
+
   http.end();
   return response;
 }
@@ -723,8 +754,17 @@ bool registerDevice(const String& deviceId, const String& deviceName, const Stri
 
 void setup() {
   Serial.begin(9600);
+  Serial.println("\n\n=== ESP32 Inverter Controller ===");
+  Serial.print("Firmware Version: ");
+  Serial.println(currentFirmwareVersion);
+
   testSerial.begin(9600, EspSoftwareSerial::SWSERIAL_8N1, RX, TX);
   // testSerial.setTimeout(100);
+  Serial.print("STM32 Serial: RX=");
+  Serial.print(RX);
+  Serial.print(", TX=");
+  Serial.println(TX);
+
   WiFi.mode(WIFI_AP_STA);
   EEPROM.begin(512);
   
@@ -748,31 +788,50 @@ void setup() {
   }
   
   WiFi.softAP(wifiBroadcastSSID.c_str(), "", 6);
+  Serial.print("Access Point SSID: ");
+  Serial.println(wifiBroadcastSSID);
+
   pinMode(STM_READY, INPUT);
   pinMode(STM_START, OUTPUT);
   WiFi.persistent(true);
   WiFi.setAutoReconnect(true);
   // clearEEPROM();
   readWifi();
+
+  // Load last setting from storage on startup
+  lastSetupValue = loadSettingFromStorage();
+  if (!lastSetupValue.isEmpty()) {
+    Serial.print("Loaded setting from storage: ");
+    Serial.println(lastSetupValue);
+  }
   http.setReuse(true);
   
   // Initialize MQTTn
   mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
+  Serial.print("MQTT Server: ");
+  Serial.print(MQTT_SERVER);
+  Serial.print(":");
+  Serial.println(MQTT_PORT);
+
   mqttClient.setCallback([](char* topic, byte* payload, unsigned int length) {
     String message = "";
     for (int i = 0; i < length; i++) {
       message += (char)payload[i];
     }
-    
+
     String topicStr = String(topic);
-    
+    Serial.println("=== MQTT MESSAGE RECEIVED ===");
+    Serial.print("Topic: ");
+    Serial.println(topicStr);
+    Serial.print("Message: ");
+    Serial.println(message);
     // Handle firmware update topic
     if (topicStr == MQTT_TOPIC_FIRMWARE) {
       handleFirmwareUpdate();
     }
   });
 
-  server.on("/wifi", HTTP_POST, [](AsyncWebServerRequest *request){    
+  server.on("/wifi", HTTP_POST, [](AsyncWebServerRequest *request){
     if (request->hasParam(PARAM_INPUT_1) && request->hasParam(PARAM_INPUT_2)) {
       param_ssid = request->getParam(PARAM_INPUT_1)->value();
       param_password = request->getParam(PARAM_INPUT_2)->value();
@@ -780,7 +839,7 @@ void setup() {
       isStartConnect = true;
       WiFi.disconnect();
       request->send_P(200, "text/plain", connectSuccess().c_str());
-      
+
     } else {
       request->send_P(200, "text/plain", connectError().c_str());
     }
@@ -806,7 +865,8 @@ void setup() {
   // start server
   server.begin();
 
-
+  Serial.println("\n=== Setup Complete ===");
+  Serial.println("System ready, entering main loop...\n");
 }
 
 void loop() {
@@ -843,7 +903,7 @@ void loop() {
   // put your main code here, to run repeatedly:
   if (isStartConnect && param_ssid.isEmpty() == false) {
     WiFi.disconnect();
-    WiFi.begin(param_ssid, param_password);
+    WiFi.begin(param_ssid.c_str(), param_password.c_str());
     WiFi.mode(WIFI_AP_STA);
     isStartConnect = false;
     isStartMqtt = true;
@@ -851,10 +911,9 @@ void loop() {
 
   // Check WiFi connection and connect MQTT when WiFi is connected
   if (WiFi.status() == WL_CONNECTED && isStartMqtt) {
-    
     configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
     writeInfo(param_ssid, param_password, uid);
-    
+
     if (connectToMqtt()) {
       isMqttConnected = true;
       isStartMqtt = false;
@@ -889,15 +948,35 @@ void loop() {
   // check MQTT connection and publish data
   if (currentMillis - previousMillis >= interval && isMqttConnected) {
 
-    previousMillis = currentMillis;    
+    previousMillis = currentMillis;
+
+    // Debug: Check if data is available from STM32
+    Serial.println("=== Reading STM32 Data ===");
+    int available = testSerial.available();
+    Serial.print("Bytes available: ");
+    Serial.println(available);
+
     String res = testSerial.readString();
     // String res = dataExample; // For testing, replace with testSerial.readString();
     res.trim();
+
+    Serial.print("Raw data: [");
+    Serial.print(res);
+    Serial.println("]");
+    Serial.print("Length: ");
+    Serial.println(res.length());
+
     if (res.isEmpty()) {
+      Serial.println("No data from STM32");
+      Serial.println("=======================");
     } else {
       int indexOf = res.indexOf("*");
+      Serial.print("Index of '*': ");
+      Serial.println(indexOf);
 
           res = res.substring(0, indexOf);
+          Serial.print("Data after trim: ");
+          Serial.println(res);
 
           String currentUid = getUid();
           
@@ -934,21 +1013,36 @@ void loop() {
         
           // Publish data via MQTT
           String jsonString = "{\"value\":\"" + res + "\",\"totalA2Capacity\":\"" + String((double)totalA2) + "\",\"totalACapacity\":\"" + String((double)totalA)  + "\"}";
+
+          Serial.println("=== Publishing to MQTT ===");
+          Serial.print("Topic: ");
+          Serial.println(MQTT_TOPIC_DATA);
+          Serial.print("Payload: ");
+          Serial.println(jsonString);
+
           if (!MQTT_TOPIC_DATA.isEmpty()) {
             String signedJsonString = createSignedMessage(jsonString);
             bool dataPublished = mqttClient.publish(MQTT_TOPIC_DATA.c_str(), signedJsonString.c_str());
+            Serial.print("Publish result: ");
+            Serial.println(dataPublished ? "SUCCESS" : "FAILED");
             if (dataPublished) {
+              Serial.println("Data sent to MQTT successfully");
+            } else {
+              Serial.println("Failed to send data to MQTT");
             }
+          } else {
+            Serial.println("MQTT_TOPIC_DATA is empty!");
           }
+          Serial.println("=======================");
     }
-    
+
   }
 
   // // WiFi connection monitoring and reconnection
   if ((WiFi.status() != WL_CONNECTED) && (currentMillis - previousMillisWifi >= intervalWifi)) {
     WiFi.reconnect();
     previousMillisWifi = currentMillis;
-    
+
     // Reset MQTT connection status when WiFi disconnects
     isMqttConnected = false;
     connectMqtt = 0;
@@ -965,7 +1059,7 @@ void loop() {
       // Publish status update via MQTT
       char timeStringBuff[50];
       strftime(timeStringBuff, sizeof(timeStringBuff), "%Y-%m-%dT%H:%M:%SZ", &timeinfo);
-      
+
       if (!MQTT_TOPIC_STATUS.isEmpty()) {
         String statusMsg = "{\"updatedAt\":\"" + String(timeStringBuff) + "\",\"status\":\"online\"}";
         String signedStatusMsg = createSignedMessage(statusMsg);
@@ -980,17 +1074,31 @@ void loop() {
     } else {
       // Don't update previousMillisMqtt here so we keep trying
     }
-    
+
   }
 
   // Ensure MQTT connection is maintained - check WiFi first, then connect MQTT with interval
   if (WiFi.status() == WL_CONNECTED) {
     if (!mqttClient.connected() && (currentMillis - previousMillisMqttReconnect >= intervalMqttReconnect)) {
+      Serial.println("=== MQTT Reconnection Required ===");
+      Serial.print("MQTT State: ");
+      Serial.println(mqttClient.state());
+      Serial.print("isMqttConnected: ");
+      Serial.println(isMqttConnected ? "true" : "false");
+
       isMqttConnected = false; // Reset flag before attempting reconnection
       if (connectToMqtt()) {
+        Serial.println("MQTT Reconnection successful");
       } else {
+        Serial.println("MQTT Reconnection failed, will retry in 10s");
       }
       previousMillisMqttReconnect = currentMillis;
+      Serial.println("===================================");
+    }
+  } else {
+    if (isMqttConnected) {
+      Serial.println("WiFi down, cannot maintain MQTT connection");
+      isMqttConnected = false;
     }
   }
 
