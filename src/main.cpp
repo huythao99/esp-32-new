@@ -12,7 +12,7 @@
 #include <Preferences.h>
 #include <HTTPUpdate.h>
 
-#define WIFI_BROADCAST_SSID "GTIControl855"
+#define WIFI_BROADCAST_SSID "GTIControl921"
 
 #define KEY_SPLIT "&&&&"
 #define KEY_SPLIT_DATA "#"
@@ -84,7 +84,7 @@ int countLCD = 0;
 
 String uid;
 String wifiBroadcastSSID; // Variable to store SSID from Preferences
-String currentFirmwareVersion = "1.0.2"; // Variable to store current firmware version
+String currentFirmwareVersion = "1.0.3"; // Variable to store current firmware version
 
 int connectMqtt = -1; // -1: pending; 0: failed; 1: success
 bool isMqttConnected = false;
@@ -126,7 +126,7 @@ struct ScheduleItem {
     String outValue;
 };
 
-ScheduleItem schedules[3]; // Array to hold up to 3 schedule items
+ScheduleItem schedules[10]; // Array to hold up to 10 schedule items
 int scheduleCount = 0;
 
 String readStringFromEEPROM(int addr) {
@@ -238,20 +238,31 @@ void parseScheduleData(const String& scheduleData) {
     // Get current time
     struct tm timeinfo;
     if(!getLocalTime(&timeinfo)){
+        // NTP time not available - fallback to stored device setting
+        if (!lastSetupValue.isEmpty()) {
+            testSerial.write(lastSetupValue.c_str());
+        }
         return;
     }
-    
+
     char timeStr[6];
     strftime(timeStr, sizeof(timeStr), "%H:%M", &timeinfo);
     String currentTime = String(timeStr);
-    
+
+    // Clear old schedule data to avoid stale entries
+    for(int i = 0; i < 10; i++) {
+        schedules[i].startTime = "";
+        schedules[i].endTime = "";
+        schedules[i].value = "";
+        schedules[i].outValue = "";
+    }
     scheduleCount = 0;
     int startIndex = 0;
     int endIndex = 0;
     bool foundMatchingSchedule = false;
     
     // Loop through the string to find each schedule
-    while (startIndex < scheduleData.length() && scheduleCount < 3 && !foundMatchingSchedule) {
+    while (startIndex < scheduleData.length() && scheduleCount < 10 && !foundMatchingSchedule) {
         // Find the next schedule using # as separator
         endIndex = scheduleData.indexOf('#', startIndex);
         if (endIndex == -1) endIndex = scheduleData.length();
@@ -263,19 +274,22 @@ void parseScheduleData(const String& scheduleData) {
         int endPos = schedule.indexOf("&", startPos);
         if (startPos != -1) {
             schedules[scheduleCount].startTime = schedule.substring(startPos + 6, endPos);
+            schedules[scheduleCount].startTime.trim();
         }
-        
+
         // Parse end time
         startPos = schedule.indexOf("end=");
         endPos = schedule.indexOf("&", startPos);
         if (startPos != -1) {
             schedules[scheduleCount].endTime = schedule.substring(startPos + 4, endPos);
+            schedules[scheduleCount].endTime.trim();
         }
-        
+
         // Parse value
         startPos = schedule.indexOf("value=");
         if (startPos != -1) {
             schedules[scheduleCount].value = schedule.substring(startPos + 6);
+            schedules[scheduleCount].value.trim();
         }
         
         
