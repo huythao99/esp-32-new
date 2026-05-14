@@ -12,7 +12,7 @@
 #include <Preferences.h>
 #include <HTTPUpdate.h>
 
-#define WIFI_BROADCAST_SSID "GTIControl921"
+#define WIFI_BROADCAST_SSID "GTIControl963"
 
 #define KEY_SPLIT "&&&&"
 #define KEY_SPLIT_DATA "#"
@@ -84,7 +84,7 @@ int countLCD = 0;
 
 String uid;
 String wifiBroadcastSSID; // Variable to store SSID from Preferences
-String currentFirmwareVersion = "1.0.3"; // Variable to store current firmware version
+String currentFirmwareVersion = "1.0.5"; // Variable to store current firmware version
 
 int connectMqtt = -1; // -1: pending; 0: failed; 1: success
 bool isMqttConnected = false;
@@ -819,9 +819,11 @@ void setup() {
     Serial.println(lastSetupValue);
   }
   http.setReuse(true);
-  
-  // Initialize MQTTn
+  http.setTimeout(3000);  // 3 second timeout to prevent long blocking
+
+  // Initialize MQTT
   mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
+  mqttClient.setKeepAlive(60);  // 60 second keep-alive for stability
   Serial.print("MQTT Server: ");
   Serial.print(MQTT_SERVER);
   Serial.print(":");
@@ -898,9 +900,13 @@ void loop() {
   }
 
 
-  // MQTT loop
-  if (mqttClient.connected()) {
-    mqttClient.loop();
+  // MQTT loop - always call to detect disconnection
+  mqttClient.loop();
+
+  // Sync isMqttConnected flag with actual connection state
+  if (isMqttConnected && !mqttClient.connected()) {
+    isMqttConnected = false;
+    connectMqtt = 0;
   }
 
   if (isStartChangeModeWifi) {
