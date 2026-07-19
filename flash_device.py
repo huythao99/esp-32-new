@@ -14,6 +14,7 @@ from pathlib import Path
 
 MAIN_CPP_PATH = "src/main.cpp"
 SSID_PATTERN = r'#define WIFI_BROADCAST_SSID "GTIControl(\d+)"'
+DEBUG_PATTERN = r'#define DEBUG \d+'
 
 def find_pio():
     """Find PlatformIO CLI executable"""
@@ -65,6 +66,18 @@ def set_ssid_number(number):
         f.write(new_content)
     print(f"[OK] SSID set to: GTIControl{number}")
 
+def set_debug(value):
+    """Force the DEBUG flag in main.cpp (0 = production, no serial debug logs)"""
+    with open(MAIN_CPP_PATH, 'r') as f:
+        content = f.read()
+    new_content, count = re.subn(DEBUG_PATTERN, f'#define DEBUG {value}', content, count=1)
+    if count == 0:
+        print("[WARN] Could not find '#define DEBUG' in main.cpp; skipping")
+        return
+    with open(MAIN_CPP_PATH, 'w') as f:
+        f.write(new_content)
+    print(f"[OK] DEBUG set to: {value}")
+
 def build_firmware():
     """Build firmware once"""
     print(f"\n[BUILD] Building firmware... (using: {PIO_PATH})")
@@ -100,6 +113,9 @@ def flash_single_device(device_number, ssid_number):
 
 def main():
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
+
+    # Production flashing: disable serial debug logs.
+    set_debug(0)
 
     # Get device count from argument (default: 1)
     device_count = int(sys.argv[1]) if len(sys.argv) > 1 else 1

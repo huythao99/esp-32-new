@@ -13,6 +13,18 @@
 #include <HTTPUpdate.h>
 #include "wifi_page.h"
 
+// Debug logging. Set DEBUG to 0 for production to compile out all USB-serial
+// debug output (removes ~90 blocking Serial.print calls from the hot paths).
+// Note: this only affects the USB Serial; the STM32 link (testSerial) is untouched.
+#define DEBUG 1
+#if DEBUG
+  #define DBG_PRINT(...)   Serial.print(__VA_ARGS__)
+  #define DBG_PRINTLN(...) Serial.println(__VA_ARGS__)
+#else
+  #define DBG_PRINT(...)   do {} while (0)
+  #define DBG_PRINTLN(...) do {} while (0)
+#endif
+
 #define WIFI_BROADCAST_SSID "GTIControl1171"
 
 #define KEY_SPLIT "&&&&"
@@ -49,6 +61,16 @@ String MQTT_TOPIC_SCHEDULE;
 String MQTT_TOPIC_STATUS;
 String MQTT_TOPIC_FIRMWARE;
 String MQTT_TOPIC_OTA_STATUS;
+String MQTT_TOPIC_CMD_SETTINGS;   // server tells us to re-fetch the setting
+String MQTT_TOPIC_CMD_SCHEDULE;   // server tells us to re-fetch the schedule
+
+// Command sync state (debounced): the MQTT callback only sets these flags; the
+// actual blocking HTTP fetch runs from loop() so the MQTT callback stays fast.
+volatile bool cmdSettingsPending = false;
+volatile bool cmdSchedulePending = false;
+unsigned long cmdSettingsAt = 0;
+unsigned long cmdScheduleAt = 0;
+const long cmdDebounce = 500;     // coalesce bursts arriving within 500ms
 
 
 String DEVICES_PATH = "/devices/inverter/";
@@ -85,7 +107,7 @@ int countLCD = 0;
 
 String uid;
 String wifiBroadcastSSID; // Variable to store SSID from Preferences
-String currentFirmwareVersion = "1.0.6"; // Variable to store current firmware version
+String currentFirmwareVersion = "1.0.7"; // Variable to store current firmware version
 
 int connectMqtt = -1; // -1: pending; 0: failed; 1: success
 bool isMqttConnected = false;
@@ -111,8 +133,8 @@ const long intervalDigital = 1000;
 const long intervalWifi = 60000;
 const long intervalMqtt = 1000;
 const long intervalMqttReconnect = 10000;
-const long invertalSetting = 3000;
-const long intervalSchedule = 3000;
+const long invertalSetting = 60000;   // slow backstop poll; real-time via cmd/settings MQTT
+const long intervalSchedule = 60000;  // slow backstop poll; real-time via cmd/schedule MQTT
 const long intervalScan = 5000;
 
 // WiFi scan state for the setup page. The scan runs from loop() (not from the
@@ -162,6 +184,7 @@ String readStringFromEEPROM(int addr) {
 
 String getUid() {
   if (uid.isEmpty() == false) {
+    uid.trim();  // normalise stray whitespace (used in MQTT topics + URLs)
     return uid;
   }
   String strText = readStringFromEEPROM(0);
@@ -178,6 +201,7 @@ String getUid() {
   param_password = strText.substring(0, index_split);
   strText.replace(param_password + key_split, "");
   uid = strText;
+  uid.trim();
   return uid;
 }
 
@@ -271,10 +295,10 @@ bool trackLogError(const String& errorCode, const String& errorMessage) {
   int httpResponseCode = http.POST(jsonPayload);
   bool success = (httpResponseCode == 200 || httpResponseCode == 201);
 
-  Serial.print("Track error log [");
-  Serial.print(errorCode);
-  Serial.print("] -> HTTP ");
-  Serial.println(httpResponseCode);
+  DBG_PRINT("Track error log [");
+  DBG_PRINT(errorCode);
+  DBG_PRINT("] -> HTTP ");
+  DBG_PRINTLN(httpResponseCode);
 
   http.end();
   return success;
@@ -397,12 +421,13 @@ void readWifi() {
   param_password = strText.substring(0, index_split);
   strText.replace(param_password + key_split, "");
   uid = strText;
+  uid.trim();
   isStartConnect = true;
 }
 
 // Reset WiFi to clear DNS cache and stale sockets
 void resetWiFiConnection() {
-    Serial.println("=== Resetting WiFi to clear DNS cache ===");
+    DBG_PRINTLN("=== Resetting WiFi to clear DNS cache ===");
     mqttClient.disconnect();
     WiFi.disconnect(true);  // true = erase credentials from memory
     delay(1000);
@@ -413,16 +438,16 @@ void resetWiFiConnection() {
     int attempts = 0;
     while (WiFi.status() != WL_CONNECTED && attempts < 20) {
         delay(500);
-        Serial.print(".");
+        DBG_PRINT(".");
         attempts++;
     }
-    Serial.println();
+    DBG_PRINTLN();
 
     if (WiFi.status() == WL_CONNECTED) {
-        Serial.println("WiFi reconnected after reset");
+        DBG_PRINTLN("WiFi reconnected after reset");
         configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
     } else {
-        Serial.println("WiFi reconnect failed, will retry later");
+        DBG_PRINTLN("WiFi reconnect failed, will retry later");
     }
 }
 
@@ -446,20 +471,31 @@ bool connectToMqtt() {
             MQTT_TOPIC_STATUS = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/status";
             MQTT_TOPIC_FIRMWARE = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/firmware/update";
             MQTT_TOPIC_OTA_STATUS = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/ota/status";
+            MQTT_TOPIC_CMD_SETTINGS = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/cmd/settings";
+            MQTT_TOPIC_CMD_SCHEDULE = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/cmd/schedule";
 
             mqttClient.subscribe(MQTT_TOPIC_SETUP.c_str());
             mqttClient.subscribe(MQTT_TOPIC_SCHEDULE.c_str());
             mqttClient.subscribe(MQTT_TOPIC_STATUS.c_str());
             mqttClient.subscribe(MQTT_TOPIC_DATA.c_str());
             mqttClient.subscribe(MQTT_TOPIC_FIRMWARE.c_str());
+            mqttClient.subscribe(MQTT_TOPIC_CMD_SETTINGS.c_str(), 1);  // QoS 1
+            mqttClient.subscribe(MQTT_TOPIC_CMD_SCHEDULE.c_str(), 1);  // QoS 1
+
+            DBG_PRINT("Subscribed cmd/settings: [");
+            DBG_PRINT(MQTT_TOPIC_CMD_SETTINGS);
+            DBG_PRINTLN("]");
+            DBG_PRINT("Subscribed cmd/schedule: [");
+            DBG_PRINT(MQTT_TOPIC_CMD_SCHEDULE);
+            DBG_PRINTLN("]");
         }
         return true;
     } else {
         isMqttConnected = false;
         connectMqtt = 0;
         mqttFailCount++;  // Increment fail counter
-        Serial.print("MQTT connection failed, fail count: ");
-        Serial.println(mqttFailCount);
+        DBG_PRINT("MQTT connection failed, fail count: ");
+        DBG_PRINTLN(mqttFailCount);
         return false;
     }
 }
@@ -523,18 +559,18 @@ String loadWifiBroadcastSSID() {
 
 void publishOTAStatus(const String& status, const String& message = "", int progress = -1) {
   // Print OTA status to Serial for monitoring
-  Serial.print("OTA Status: ");
-  Serial.print(status);
+  DBG_PRINT("OTA Status: ");
+  DBG_PRINT(status);
   if (!message.isEmpty()) {
-    Serial.print(" - ");
-    Serial.print(message);
+    DBG_PRINT(" - ");
+    DBG_PRINT(message);
   }
   if (progress >= 0) {
-    Serial.print(" (");
-    Serial.print(progress);
-    Serial.print("%)");
+    DBG_PRINT(" (");
+    DBG_PRINT(progress);
+    DBG_PRINT("%)");
   }
-  Serial.println();
+  DBG_PRINTLN();
   
   if (!mqttClient.connected() || MQTT_TOPIC_OTA_STATUS.isEmpty()) {
     return;
@@ -560,8 +596,8 @@ void publishOTAStatus(const String& status, const String& message = "", int prog
   jsonStatus += "}";
   
   bool published = mqttClient.publish(MQTT_TOPIC_OTA_STATUS.c_str(), jsonStatus.c_str());
-  Serial.print("MQTT OTA status published: ");
-  Serial.println(published ? "Success" : "Failed");
+  DBG_PRINT("MQTT OTA status published: ");
+  DBG_PRINTLN(published ? "Success" : "Failed");
 }
 
 bool updateFirmwareVersion(const String& firmwareVersion) {
@@ -698,14 +734,14 @@ bool performFOTAUpdate(const String& firmwareURL) {
 
 
 void handleFirmwareUpdate() {
-  Serial.println("=== FIRMWARE UPDATE STARTED ===");
+  DBG_PRINTLN("=== FIRMWARE UPDATE STARTED ===");
   
   // Publish starting status
   publishOTAStatus("starting", "Requesting firmware URL from server");
   
   String s3URL = getFirmwareS3URL();
-  Serial.print("S3 URL received: ");
-  Serial.println(s3URL.isEmpty() ? "EMPTY" : s3URL);
+  DBG_PRINT("S3 URL received: ");
+  DBG_PRINTLN(s3URL.isEmpty() ? "EMPTY" : s3URL);
   
   if (s3URL.isEmpty()) {
     publishOTAStatus("failed", "Failed to get firmware URL from server");
@@ -717,14 +753,14 @@ void handleFirmwareUpdate() {
   publishOTAStatus("downloading", "Starting firmware download");
   
   bool updateResult = performFOTAUpdate(s3URL);
-  Serial.print("Update result: ");
-  Serial.println(updateResult ? "SUCCESS" : "FAILED");
+  DBG_PRINT("Update result: ");
+  DBG_PRINTLN(updateResult ? "SUCCESS" : "FAILED");
   
   if (updateResult) {
-    Serial.println("=== FIRMWARE UPDATE SUCCESSFUL ===");
+    DBG_PRINTLN("=== FIRMWARE UPDATE SUCCESSFUL ===");
     publishOTAStatus("success", "Firmware update completed successfully, rebooting...");
   } else {
-    Serial.println("=== FIRMWARE UPDATE FAILED ===");
+    DBG_PRINTLN("=== FIRMWARE UPDATE FAILED ===");
     publishOTAStatus("failed", "Firmware download or installation failed");
     trackLogError("FOTA_FAILED", "Firmware download or installation failed");
   }
@@ -766,8 +802,8 @@ String getDeviceSettings(const String& deviceUid, const String& deviceSSID) {
       if (!error) {
         // Extract settings values if they exist
         String value = doc["value"].as<String>();
-        Serial.print("Setting value: ");
-        Serial.println(value);
+        DBG_PRINT("Setting value: ");
+        DBG_PRINTLN(value);
         String newSetupValue = convertSetupValue(value);
 
         // Save to storage only if value has changed
@@ -800,7 +836,7 @@ String getScheduleSettings(const String& deviceUid, const String& deviceSSID) {
   }
   
   // HTTPClient http;
-  String url = "https://giabao-inverter.com/api/inverter-schedule/data/" + deviceUid + "/" + deviceSSID;
+  String url = "https://giabao-inverter.com/api/inverter-schedule/data/" + deviceUid + "/" + deviceSSID + "?source=hardware";
   
   
   http.begin(url);
@@ -873,16 +909,16 @@ bool registerDevice(const String& deviceId, const String& deviceName, const Stri
 
 void setup() {
   Serial.begin(9600);
-  Serial.println("\n\n=== ESP32 Inverter Controller ===");
-  Serial.print("Firmware Version: ");
-  Serial.println(currentFirmwareVersion);
+  DBG_PRINTLN("\n\n=== ESP32 Inverter Controller ===");
+  DBG_PRINT("Firmware Version: ");
+  DBG_PRINTLN(currentFirmwareVersion);
 
   testSerial.begin(9600, EspSoftwareSerial::SWSERIAL_8N1, RX, TX);
   // testSerial.setTimeout(100);
-  Serial.print("STM32 Serial: RX=");
-  Serial.print(RX);
-  Serial.print(", TX=");
-  Serial.println(TX);
+  DBG_PRINT("STM32 Serial: RX=");
+  DBG_PRINT(RX);
+  DBG_PRINT(", TX=");
+  DBG_PRINTLN(TX);
 
   WiFi.mode(WIFI_AP_STA);
   EEPROM.begin(512);
@@ -907,8 +943,8 @@ void setup() {
   }
   
   WiFi.softAP(wifiBroadcastSSID.c_str(), "", 6);
-  Serial.print("Access Point SSID: ");
-  Serial.println(wifiBroadcastSSID);
+  DBG_PRINT("Access Point SSID: ");
+  DBG_PRINTLN(wifiBroadcastSSID);
 
   pinMode(STM_READY, INPUT);
   pinMode(STM_START, OUTPUT);
@@ -920,8 +956,8 @@ void setup() {
   // Load last setting from storage on startup
   lastSetupValue = loadSettingFromStorage();
   if (!lastSetupValue.isEmpty()) {
-    Serial.print("Loaded setting from storage: ");
-    Serial.println(lastSetupValue);
+    DBG_PRINT("Loaded setting from storage: ");
+    DBG_PRINTLN(lastSetupValue);
   }
   http.setReuse(true);
   http.setTimeout(3000);  // 3 second timeout to prevent long blocking
@@ -929,10 +965,10 @@ void setup() {
   // Initialize MQTT
   mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
   mqttClient.setKeepAlive(60);  // 60 second keep-alive for stability
-  Serial.print("MQTT Server: ");
-  Serial.print(MQTT_SERVER);
-  Serial.print(":");
-  Serial.println(MQTT_PORT);
+  DBG_PRINT("MQTT Server: ");
+  DBG_PRINT(MQTT_SERVER);
+  DBG_PRINT(":");
+  DBG_PRINTLN(MQTT_PORT);
 
   mqttClient.setCallback([](char* topic, byte* payload, unsigned int length) {
     String message = "";
@@ -941,14 +977,24 @@ void setup() {
     }
 
     String topicStr = String(topic);
-    Serial.println("=== MQTT MESSAGE RECEIVED ===");
-    Serial.print("Topic: ");
-    Serial.println(topicStr);
-    Serial.print("Message: ");
-    Serial.println(message);
+    DBG_PRINTLN("=== MQTT MESSAGE RECEIVED ===");
+    DBG_PRINT("Topic: ");
+    DBG_PRINTLN(topicStr);
+    DBG_PRINT("Message: ");
+    DBG_PRINTLN(message);
     // Handle firmware update topic
     if (topicStr == MQTT_TOPIC_FIRMWARE) {
       handleFirmwareUpdate();
+    }
+    // Command topics: payload is just "{}" - react to the topic name only.
+    // Set a debounced flag; the actual HTTP fetch runs from loop().
+    else if (topicStr.endsWith("/cmd/settings")) {
+      cmdSettingsPending = true;
+      cmdSettingsAt = millis();
+    }
+    else if (topicStr.endsWith("/cmd/schedule")) {
+      cmdSchedulePending = true;
+      cmdScheduleAt = millis();
     }
   });
 
@@ -1119,6 +1165,18 @@ void loop() {
     getScheduleSettings(getUid(), wifiBroadcastSSID);
   }
 
+  // Process debounced MQTT command syncs (server asked us to re-fetch on change).
+  if (cmdSettingsPending && (currentMillis - cmdSettingsAt >= cmdDebounce)) {
+    cmdSettingsPending = false;
+    DBG_PRINTLN("[CMD] settings sync requested -> fetching setting");
+    getDeviceSettings(getUid(), wifiBroadcastSSID);
+  }
+  if (cmdSchedulePending && (currentMillis - cmdScheduleAt >= cmdDebounce)) {
+    cmdSchedulePending = false;
+    DBG_PRINTLN("[CMD] schedule sync requested -> fetching schedule");
+    getScheduleSettings(getUid(), wifiBroadcastSSID);
+  }
+
   // WiFi scan for the setup page. Runs ON DEMAND (page open / refresh) rather
   // than periodically: a scan briefly suspends the softAP (single radio), so
   // scanning repeatedly would make the portal unresponsive to the client.
@@ -1138,9 +1196,9 @@ void loop() {
     // Bounded per-channel dwell (120ms) keeps the scan — and the softAP
     // outage — short (~1.5s) so the client isn't starved for long.
     int n = WiFi.scanNetworks(false /*async*/, true /*show_hidden*/, false /*passive*/, 120 /*ms per channel*/);
-    Serial.print("WiFi scan found ");
-    Serial.print(n);
-    Serial.println(" networks");
+    DBG_PRINT("WiFi scan found ");
+    DBG_PRINT(n);
+    DBG_PRINTLN(" networks");
 
     String json = "[";
     for (int i = 0; i < n; i++) {
@@ -1160,32 +1218,32 @@ void loop() {
     previousMillis = currentMillis;
 
     // Debug: Check if data is available from STM32
-    Serial.println("=== Reading STM32 Data ===");
+    DBG_PRINTLN("=== Reading STM32 Data ===");
     int available = testSerial.available();
-    Serial.print("Bytes available: ");
-    Serial.println(available);
+    DBG_PRINT("Bytes available: ");
+    DBG_PRINTLN(available);
 
     String res = testSerial.readString();
     // String res = dataExample; // For testing, replace with testSerial.readString();
     res.trim();
 
-    Serial.print("Raw data: [");
-    Serial.print(res);
-    Serial.println("]");
-    Serial.print("Length: ");
-    Serial.println(res.length());
+    DBG_PRINT("Raw data: [");
+    DBG_PRINT(res);
+    DBG_PRINTLN("]");
+    DBG_PRINT("Length: ");
+    DBG_PRINTLN(res.length());
 
     if (res.isEmpty()) {
-      Serial.println("No data from STM32");
-      Serial.println("=======================");
+      DBG_PRINTLN("No data from STM32");
+      DBG_PRINTLN("=======================");
     } else {
       int indexOf = res.indexOf("*");
-      Serial.print("Index of '*': ");
-      Serial.println(indexOf);
+      DBG_PRINT("Index of '*': ");
+      DBG_PRINTLN(indexOf);
 
           res = res.substring(0, indexOf);
-          Serial.print("Data after trim: ");
-          Serial.println(res);
+          DBG_PRINT("Data after trim: ");
+          DBG_PRINTLN(res);
 
           String currentUid = getUid();
           
@@ -1223,26 +1281,26 @@ void loop() {
           // Publish data via MQTT
           String jsonString = "{\"value\":\"" + res + "\",\"totalA2Capacity\":\"" + String((double)totalA2) + "\",\"totalACapacity\":\"" + String((double)totalA)  + "\"}";
 
-          Serial.println("=== Publishing to MQTT ===");
-          Serial.print("Topic: ");
-          Serial.println(MQTT_TOPIC_DATA);
-          Serial.print("Payload: ");
-          Serial.println(jsonString);
+          DBG_PRINTLN("=== Publishing to MQTT ===");
+          DBG_PRINT("Topic: ");
+          DBG_PRINTLN(MQTT_TOPIC_DATA);
+          DBG_PRINT("Payload: ");
+          DBG_PRINTLN(jsonString);
 
           if (!MQTT_TOPIC_DATA.isEmpty()) {
             String signedJsonString = createSignedMessage(jsonString);
             bool dataPublished = mqttClient.publish(MQTT_TOPIC_DATA.c_str(), signedJsonString.c_str());
-            Serial.print("Publish result: ");
-            Serial.println(dataPublished ? "SUCCESS" : "FAILED");
+            DBG_PRINT("Publish result: ");
+            DBG_PRINTLN(dataPublished ? "SUCCESS" : "FAILED");
             if (dataPublished) {
-              Serial.println("Data sent to MQTT successfully");
+              DBG_PRINTLN("Data sent to MQTT successfully");
             } else {
-              Serial.println("Failed to send data to MQTT");
+              DBG_PRINTLN("Failed to send data to MQTT");
             }
           } else {
-            Serial.println("MQTT_TOPIC_DATA is empty!");
+            DBG_PRINTLN("MQTT_TOPIC_DATA is empty!");
           }
-          Serial.println("=======================");
+          DBG_PRINTLN("=======================");
     }
 
   }
@@ -1289,17 +1347,17 @@ void loop() {
   // Ensure MQTT connection is maintained - check WiFi first, then connect MQTT with interval
   if (WiFi.status() == WL_CONNECTED) {
     if (!mqttClient.connected() && (currentMillis - previousMillisMqttReconnect >= intervalMqttReconnect)) {
-      Serial.println("=== MQTT Reconnection Required ===");
-      Serial.print("MQTT State: ");
-      Serial.println(mqttClient.state());
-      Serial.print("isMqttConnected: ");
-      Serial.println(isMqttConnected ? "true" : "false");
-      Serial.print("Fail count: ");
-      Serial.println(mqttFailCount);
+      DBG_PRINTLN("=== MQTT Reconnection Required ===");
+      DBG_PRINT("MQTT State: ");
+      DBG_PRINTLN(mqttClient.state());
+      DBG_PRINT("isMqttConnected: ");
+      DBG_PRINTLN(isMqttConnected ? "true" : "false");
+      DBG_PRINT("Fail count: ");
+      DBG_PRINTLN(mqttFailCount);
 
       // Reset WiFi after too many MQTT failures to clear DNS cache
       if (mqttFailCount >= MQTT_MAX_FAIL_BEFORE_RESET) {
-        Serial.println("Too many MQTT failures, resetting WiFi...");
+        DBG_PRINTLN("Too many MQTT failures, resetting WiFi...");
         trackLogError("MQTT_FAILED", "MQTT connection failed " + String(mqttFailCount) + " times, resetting WiFi");
         resetWiFiConnection();
         mqttFailCount = 0;  // Reset counter after WiFi reset
@@ -1307,16 +1365,16 @@ void loop() {
 
       isMqttConnected = false; // Reset flag before attempting reconnection
       if (connectToMqtt()) {
-        Serial.println("MQTT Reconnection successful");
+        DBG_PRINTLN("MQTT Reconnection successful");
       } else {
-        Serial.println("MQTT Reconnection failed, will retry in 10s");
+        DBG_PRINTLN("MQTT Reconnection failed, will retry in 10s");
       }
       previousMillisMqttReconnect = currentMillis;
-      Serial.println("===================================");
+      DBG_PRINTLN("===================================");
     }
   } else {
     if (isMqttConnected) {
-      Serial.println("WiFi down, cannot maintain MQTT connection");
+      DBG_PRINTLN("WiFi down, cannot maintain MQTT connection");
       isMqttConnected = false;
     }
   }
