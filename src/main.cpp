@@ -11,8 +11,9 @@
 #include <HTTPClient.h>
 #include <Preferences.h>
 #include <HTTPUpdate.h>
+#include "wifi_page.h"
 
-#define WIFI_BROADCAST_SSID "GTIControl963"
+#define WIFI_BROADCAST_SSID "GTIControl1171"
 
 #define KEY_SPLIT "&&&&"
 #define KEY_SPLIT_DATA "#"
@@ -84,11 +85,13 @@ int countLCD = 0;
 
 String uid;
 String wifiBroadcastSSID; // Variable to store SSID from Preferences
-String currentFirmwareVersion = "1.0.5"; // Variable to store current firmware version
+String currentFirmwareVersion = "1.0.6"; // Variable to store current firmware version
 
 int connectMqtt = -1; // -1: pending; 0: failed; 1: success
 bool isMqttConnected = false;
 unsigned long lastMqttReconnectAttempt = 0;
+int mqttFailCount = 0;  // Count consecutive MQTT connection failures
+const int MQTT_MAX_FAIL_BEFORE_RESET = 6;  // Reset WiFi after 6 failures (~60 seconds)
 
 bool isStartRegisterDevice = false;
 
@@ -110,6 +113,19 @@ const long intervalMqtt = 1000;
 const long intervalMqttReconnect = 10000;
 const long invertalSetting = 3000;
 const long intervalSchedule = 3000;
+const long intervalScan = 5000;
+
+// WiFi scan state for the setup page. The scan runs from loop() (not from the
+// web handler) so repeated /scan polls can't restart it before it finishes.
+String scannedNetworksJson = "[]";  // latest scan result as JSON
+unsigned long previousMillisScan = 0;
+unsigned long lastScanRequest = 0;  // millis() of the last /scan request
+bool scanRequested = false;         // set by /scan?refresh=1, cleared after scan
+
+// Setup-page connect attempt result: -1 = in progress/idle, 0 = failed, 1 = success.
+int wifiConnectResult = -1;
+unsigned long connectAttemptStart = 0;   // 0 = no active attempt
+const long connectTimeout = 15000;       // give up after 15s and report failure
 
 String valueSetup = "";
 
@@ -207,6 +223,61 @@ String createSignedMessage(const String& payload) {
     
     // String signedMessage = "{\"payload\":\"" + payload + "\",\"timestamp\":" + String(timestamp) + ",\"signature\":\"" + signature + "\"}";
     return payload;
+}
+
+// Escape characters that would break the JSON string payload.
+String jsonEscape(const String& in) {
+  String out;
+  out.reserve(in.length() + 8);
+  for (unsigned int i = 0; i < in.length(); i++) {
+    char c = in[i];
+    if (c == '"' || c == '\\') {
+      out += '\\';
+      out += c;
+    } else if (c == '\n') {
+      out += "\\n";
+    } else if (c == '\r') {
+      out += "\\r";
+    } else if (c == '\t') {
+      out += "\\t";
+    } else {
+      out += c;
+    }
+  }
+  return out;
+}
+
+// Report an error to the backend. No authentication required; the hardware
+// POSTs directly. userId = device UID, deviceId = broadcast SSID.
+// Silently no-ops when WiFi is down so callers can log freely.
+bool trackLogError(const String& errorCode, const String& errorMessage) {
+  if (WiFi.status() != WL_CONNECTED) {
+    return false;
+  }
+
+  String currentUid = getUid();
+  String url = "https://giabao-inverter.com/api/track-log-error";
+
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+
+  String jsonPayload = "{";
+  jsonPayload += "\"userId\":\"" + jsonEscape(currentUid) + "\",";
+  jsonPayload += "\"deviceId\":\"" + jsonEscape(wifiBroadcastSSID) + "\",";
+  jsonPayload += "\"errorCode\":\"" + jsonEscape(errorCode) + "\",";
+  jsonPayload += "\"errorMessage\":\"" + jsonEscape(errorMessage) + "\"";
+  jsonPayload += "}";
+
+  int httpResponseCode = http.POST(jsonPayload);
+  bool success = (httpResponseCode == 200 || httpResponseCode == 201);
+
+  Serial.print("Track error log [");
+  Serial.print(errorCode);
+  Serial.print("] -> HTTP ");
+  Serial.println(httpResponseCode);
+
+  http.end();
+  return success;
 }
 
 bool isTimeInRange(const String& currentTime, const String& startTime, const String& endTime) {
@@ -329,6 +400,32 @@ void readWifi() {
   isStartConnect = true;
 }
 
+// Reset WiFi to clear DNS cache and stale sockets
+void resetWiFiConnection() {
+    Serial.println("=== Resetting WiFi to clear DNS cache ===");
+    mqttClient.disconnect();
+    WiFi.disconnect(true);  // true = erase credentials from memory
+    delay(1000);
+    WiFi.begin(param_ssid.c_str(), param_password.c_str());
+    WiFi.mode(WIFI_AP_STA);
+
+    // Wait for WiFi to reconnect (max 10 seconds)
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+        delay(500);
+        Serial.print(".");
+        attempts++;
+    }
+    Serial.println();
+
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("WiFi reconnected after reset");
+        configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+    } else {
+        Serial.println("WiFi reconnect failed, will retry later");
+    }
+}
+
 // MQTT connection function
 bool connectToMqtt() {
     lastMqttReconnectAttempt = millis();
@@ -338,6 +435,7 @@ bool connectToMqtt() {
     if (mqttClient.connect(clientId.c_str(), MQTT_USERNAME, MQTT_PASSWORD)) {
         isMqttConnected = true;
         connectMqtt = 1;
+        mqttFailCount = 0;  // Reset fail counter on success
 
         // Subscribe to topics
         String currentUid = getUid();
@@ -359,6 +457,9 @@ bool connectToMqtt() {
     } else {
         isMqttConnected = false;
         connectMqtt = 0;
+        mqttFailCount++;  // Increment fail counter
+        Serial.print("MQTT connection failed, fail count: ");
+        Serial.println(mqttFailCount);
         return false;
     }
 }
@@ -608,6 +709,7 @@ void handleFirmwareUpdate() {
   
   if (s3URL.isEmpty()) {
     publishOTAStatus("failed", "Failed to get firmware URL from server");
+    trackLogError("FOTA_URL_FAILED", "Failed to get firmware URL from server");
     return;
   }
   
@@ -624,6 +726,7 @@ void handleFirmwareUpdate() {
   } else {
     Serial.println("=== FIRMWARE UPDATE FAILED ===");
     publishOTAStatus("failed", "Firmware download or installation failed");
+    trackLogError("FOTA_FAILED", "Firmware download or installation failed");
   }
 }
 
@@ -643,7 +746,7 @@ String getDeviceSettings(const String& deviceUid, const String& deviceSSID) {
   }
 
   // HTTPClient http;
-  String url = "https://giabao-inverter.com/api/inverter-setting/data/" + deviceUid + "/" + deviceSSID;
+  String url = "https://giabao-inverter.com/api/inverter-setting/data/" + deviceUid + "/" + deviceSSID + "?source=hardware";
 
 
   http.begin(url);
@@ -663,6 +766,8 @@ String getDeviceSettings(const String& deviceUid, const String& deviceSSID) {
       if (!error) {
         // Extract settings values if they exist
         String value = doc["value"].as<String>();
+        Serial.print("Setting value: ");
+        Serial.println(value);
         String newSetupValue = convertSetupValue(value);
 
         // Save to storage only if value has changed
@@ -847,12 +952,31 @@ void setup() {
     }
   });
 
+  // Serve the WiFi setup page. UID comes from the URL query, e.g. "/connect?uid=abc".
+  server.on("/connect", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send_P(200, "text/html", index_html);
+  });
+
+  // Return the most recent WiFi scan result (JSON) to the setup page.
+  // The actual scan is driven from loop(); requesting this endpoint just marks
+  // the setup page as active so loop() keeps scanning.
+  server.on("/scan", HTTP_GET, [](AsyncWebServerRequest *request){
+    lastScanRequest = millis();
+    // "?refresh=1" asks loop() to run one fresh scan; plain GET just polls the
+    // cached result (so the client can read results without re-scanning).
+    if (request->hasParam("refresh")) {
+      scanRequested = true;
+    }
+    request->send(200, "application/json", scannedNetworksJson);
+  });
+
   server.on("/wifi", HTTP_POST, [](AsyncWebServerRequest *request){
     if (request->hasParam(PARAM_INPUT_1) && request->hasParam(PARAM_INPUT_2)) {
       param_ssid = request->getParam(PARAM_INPUT_1)->value();
       param_password = request->getParam(PARAM_INPUT_2)->value();
       uid = request->getParam(PARAM_INPUT_3)->value();
       isStartConnect = true;
+      lastScanRequest = 0;  // stop scanning so it can't disrupt the connection
       WiFi.disconnect();
       request->send_P(200, "text/plain", connectSuccess().c_str());
 
@@ -873,6 +997,15 @@ void setup() {
     request->send_P(200, "text/plain", String(mqttStatus()).c_str());
   });
 
+  // Read-only status for the setup page to poll after Connect is pressed.
+  // wifi: wl_status_t (3 = connected). mqtt: -1 pending, 0 failed, 1 success.
+  server.on("/connect-status", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String json = "{\"wifi\":" + String((int)WiFi.status()) +
+                  ",\"mqtt\":" + String(connectMqtt) +
+                  ",\"result\":" + String(wifiConnectResult) + "}";
+    request->send(200, "application/json", json);
+  });
+
   server.on("/change-mode-wifi", HTTP_GET, [](AsyncWebServerRequest *request) {
     isStartChangeModeWifi = true;
     request->send_P(200, "text/plain", connectSuccess().c_str());
@@ -880,9 +1013,6 @@ void setup() {
 
   // start server
   server.begin();
-
-  Serial.println("\n=== Setup Complete ===");
-  Serial.println("System ready, entering main loop...\n");
 }
 
 void loop() {
@@ -922,11 +1052,34 @@ void loop() {
   // listenButtonEvent();
   // put your main code here, to run repeatedly:
   if (isStartConnect && param_ssid.isEmpty() == false) {
+    scanRequested = false;  // don't let a pending scan disrupt the connection
     WiFi.disconnect();
+    // Disable auto-reconnect for the attempt: on a wrong password it would
+    // otherwise rescan/retry forever, knocking the softAP off-channel and making
+    // this page unreachable. One clean attempt keeps the AP stable.
+    WiFi.setAutoReconnect(false);
     WiFi.begin(param_ssid.c_str(), param_password.c_str());
     WiFi.mode(WIFI_AP_STA);
     isStartConnect = false;
     isStartMqtt = true;
+    wifiConnectResult = -1;               // attempt in progress
+    connectAttemptStart = currentMillis;  // start the timeout clock
+  }
+
+  // Resolve the setup-page connect attempt (success, or failure/timeout).
+  if (connectAttemptStart != 0 && wifiConnectResult == -1) {
+    wl_status_t st = WiFi.status();
+    if (st == WL_CONNECTED) {
+      wifiConnectResult = 1;
+      connectAttemptStart = 0;
+      WiFi.setAutoReconnect(true);   // restore normal reconnect behaviour
+    } else if (st == WL_CONNECT_FAILED || st == WL_NO_SSID_AVAIL ||
+               currentMillis - connectAttemptStart >= connectTimeout) {
+      wifiConnectResult = 0;         // wrong password / not found / out of range
+      connectAttemptStart = 0;
+      isStartMqtt = false;           // don't keep waiting for MQTT on failure
+      WiFi.disconnect();             // keep the STA idle so the softAP is stable
+    }
   }
 
   // Check WiFi connection and connect MQTT when WiFi is connected
@@ -947,9 +1100,10 @@ void loop() {
     if (!currentUid.isEmpty()) {
       // Register device via API first
       bool apiRegistered = registerDevice(wifiBroadcastSSID, wifiBroadcastSSID, currentUid);
-      
+
       if (apiRegistered) {
       } else {
+        trackLogError("DEVICE_REGISTER_FAILED", "Failed to register device via API");
       }
     }
     isStartRegisterDevice = false;
@@ -963,6 +1117,41 @@ void loop() {
   if (currentMillis - previousMillisSchedule >= intervalSchedule) {
     previousMillisSchedule = currentMillis;
     getScheduleSettings(getUid(), wifiBroadcastSSID);
+  }
+
+  // WiFi scan for the setup page. Runs ON DEMAND (page open / refresh) rather
+  // than periodically: a scan briefly suspends the softAP (single radio), so
+  // scanning repeatedly would make the portal unresponsive to the client.
+  // The 3s throttle guards against rapid refresh spam.
+  if (scanRequested && (previousMillisScan == 0 || currentMillis - previousMillisScan >= 3000)) {
+    scanRequested = false;
+    previousMillisScan = currentMillis;
+
+    // If the STA is mid-association the scan fails with -2 (WIFI_SCAN_FAILED).
+    // Disconnect (without erasing credentials) to free the radio.
+    if (WiFi.status() != WL_CONNECTED) {
+      WiFi.disconnect(false);
+      delay(50);
+    }
+
+    WiFi.scanDelete();
+    // Bounded per-channel dwell (120ms) keeps the scan — and the softAP
+    // outage — short (~1.5s) so the client isn't starved for long.
+    int n = WiFi.scanNetworks(false /*async*/, true /*show_hidden*/, false /*passive*/, 120 /*ms per channel*/);
+    Serial.print("WiFi scan found ");
+    Serial.print(n);
+    Serial.println(" networks");
+
+    String json = "[";
+    for (int i = 0; i < n; i++) {
+      if (i) json += ",";
+      json += "{\"ssid\":\"" + jsonEscape(WiFi.SSID(i)) + "\",";
+      json += "\"rssi\":" + String(WiFi.RSSI(i)) + ",";
+      json += "\"secure\":" + String(WiFi.encryptionType(i) == WIFI_AUTH_OPEN ? 0 : 1) + "}";
+    }
+    json += "]";
+    scannedNetworksJson = json;
+    WiFi.scanDelete();
   }
 
   // check MQTT connection and publish data
@@ -1105,6 +1294,16 @@ void loop() {
       Serial.println(mqttClient.state());
       Serial.print("isMqttConnected: ");
       Serial.println(isMqttConnected ? "true" : "false");
+      Serial.print("Fail count: ");
+      Serial.println(mqttFailCount);
+
+      // Reset WiFi after too many MQTT failures to clear DNS cache
+      if (mqttFailCount >= MQTT_MAX_FAIL_BEFORE_RESET) {
+        Serial.println("Too many MQTT failures, resetting WiFi...");
+        trackLogError("MQTT_FAILED", "MQTT connection failed " + String(mqttFailCount) + " times, resetting WiFi");
+        resetWiFiConnection();
+        mqttFailCount = 0;  // Reset counter after WiFi reset
+      }
 
       isMqttConnected = false; // Reset flag before attempting reconnection
       if (connectToMqtt()) {
