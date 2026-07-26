@@ -16,7 +16,7 @@
 // Debug logging. Set DEBUG to 0 for production to compile out all USB-serial
 // debug output (removes ~90 blocking Serial.print calls from the hot paths).
 // Note: this only affects the USB Serial; the STM32 link (testSerial) is untouched.
-#define DEBUG 1
+#define DEBUG 0
 #if DEBUG
   #define DBG_PRINT(...)   Serial.print(__VA_ARGS__)
   #define DBG_PRINTLN(...) Serial.println(__VA_ARGS__)
@@ -63,6 +63,7 @@ String MQTT_TOPIC_FIRMWARE;
 String MQTT_TOPIC_OTA_STATUS;
 String MQTT_TOPIC_CMD_SETTINGS;   // server tells us to re-fetch the setting
 String MQTT_TOPIC_CMD_SCHEDULE;   // server tells us to re-fetch the schedule
+String MQTT_TOPIC_SHARE;          // server pushes this device's computed share value
 
 // Command sync state (debounced): the MQTT callback only sets these flags; the
 // actual blocking HTTP fetch runs from loop() so the MQTT callback stays fast.
@@ -71,6 +72,11 @@ volatile bool cmdSchedulePending = false;
 unsigned long cmdSettingsAt = 0;
 unsigned long cmdScheduleAt = 0;
 const long cmdDebounce = 500;     // coalesce bursts arriving within 500ms
+
+// Share value state (debounced): computed pool split pushed by the server ~10s.
+volatile bool sharePending = false;
+volatile int  shareValue = 0;     // pre-cap share value from payload (watts)
+unsigned long shareAt = 0;
 
 
 String DEVICES_PATH = "/devices/inverter/";
@@ -238,6 +244,30 @@ String loadSettingFromStorage() {
   String value = preferences.getString("setup_value", "");
   preferences.end();
   return value;
+}
+
+// Apply a share value pushed by the server. lastSetupValue is "*pset@vset#";
+// keep pset (the cap) and replace the value (vset) with the share value,
+// clamped to a max of 4 digits, then write it to the STM32.
+void applyShareValue(int shareWatts) {
+  int at = lastSetupValue.indexOf('@');
+  if (lastSetupValue.length() < 2 || lastSetupValue[0] != '*' || at < 1) {
+    DBG_PRINTLN("[SHARE] no setting known yet - ignoring share value");
+    return;
+  }
+
+  int value = shareWatts;
+  if (value > 9999) value = 9999;   // max 4 digits
+  if (value < 0)    value = 0;
+
+  String pset = lastSetupValue.substring(1, at);          // keep the cap part
+  String out = "*" + pset + "@" + String(value) + "#";    // replace the value
+  lastSetupValue = out;             // remember as the current operational value
+  testSerial.write(out.c_str());    // write to STM32
+  DBG_PRINT("[SHARE] value=");
+  DBG_PRINT(shareWatts);
+  DBG_PRINT(" -> ");
+  DBG_PRINTLN(out);
 }
 
 
@@ -473,6 +503,7 @@ bool connectToMqtt() {
             MQTT_TOPIC_OTA_STATUS = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/ota/status";
             MQTT_TOPIC_CMD_SETTINGS = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/cmd/settings";
             MQTT_TOPIC_CMD_SCHEDULE = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/cmd/schedule";
+            MQTT_TOPIC_SHARE = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/share";
 
             mqttClient.subscribe(MQTT_TOPIC_SETUP.c_str());
             mqttClient.subscribe(MQTT_TOPIC_SCHEDULE.c_str());
@@ -481,6 +512,7 @@ bool connectToMqtt() {
             mqttClient.subscribe(MQTT_TOPIC_FIRMWARE.c_str());
             mqttClient.subscribe(MQTT_TOPIC_CMD_SETTINGS.c_str(), 1);  // QoS 1
             mqttClient.subscribe(MQTT_TOPIC_CMD_SCHEDULE.c_str(), 1);  // QoS 1
+            mqttClient.subscribe(MQTT_TOPIC_SHARE.c_str(), 1);         // QoS 1
 
             DBG_PRINT("Subscribed cmd/settings: [");
             DBG_PRINT(MQTT_TOPIC_CMD_SETTINGS);
@@ -996,6 +1028,15 @@ void setup() {
       cmdSchedulePending = true;
       cmdScheduleAt = millis();
     }
+    // Share topic: payload is {"value":N}. Parse it and defer applying to loop().
+    else if (topicStr.endsWith("/share")) {
+      JsonDocument doc;
+      if (deserializeJson(doc, message) == DeserializationError::Ok) {
+        shareValue = doc["value"].as<int>();
+        sharePending = true;
+        shareAt = millis();
+      }
+    }
   });
 
   // Serve the WiFi setup page. UID comes from the URL query, e.g. "/connect?uid=abc".
@@ -1175,6 +1216,12 @@ void loop() {
     cmdSchedulePending = false;
     DBG_PRINTLN("[CMD] schedule sync requested -> fetching schedule");
     getScheduleSettings(getUid(), wifiBroadcastSSID);
+  }
+
+  // Process debounced share value pushed by the server (~every 10s).
+  if (sharePending && (currentMillis - shareAt >= cmdDebounce)) {
+    sharePending = false;
+    applyShareValue(shareValue);
   }
 
   // WiFi scan for the setup page. Runs ON DEMAND (page open / refresh) rather
