@@ -16,7 +16,7 @@
 // Debug logging. Set DEBUG to 0 for production to compile out all USB-serial
 // debug output (removes ~90 blocking Serial.print calls from the hot paths).
 // Note: this only affects the USB Serial; the STM32 link (testSerial) is untouched.
-#define DEBUG 0
+#define DEBUG 1
 #if DEBUG
   #define DBG_PRINT(...)   Serial.print(__VA_ARGS__)
   #define DBG_PRINTLN(...) Serial.println(__VA_ARGS__)
@@ -77,6 +77,22 @@ const long cmdDebounce = 500;     // coalesce bursts arriving within 500ms
 volatile bool sharePending = false;
 volatile int  shareValue = 0;     // pre-cap share value from payload (watts)
 unsigned long shareAt = 0;
+
+// Active share value (drives the STM32 while it is fresh). shareValidMs after
+// the last share message, share is considered inactive and we fall through to
+// schedule / setting.
+int activeShareValue = -1;        // -1 = no share received
+unsigned long activeShareAt = 0;
+const long shareValidMs = 30000;  // share is "active" for 30s after last message
+
+// Single-writer state: the ONLY place that writes to the STM32 is
+// applyCurrentValue(), which picks the effective value by priority
+// share > schedule > setting. It writes on change plus a periodic keepalive.
+String lastWrittenValue = "";
+unsigned long lastWriteAt = 0;
+unsigned long previousMillisApply = 0;
+const long intervalApply = 1000;      // re-evaluate the effective value every 1s
+const long applyKeepaliveMs = 3000;   // re-send the same value at least this often
 
 
 String DEVICES_PATH = "/devices/inverter/";
@@ -230,6 +246,12 @@ String convertSetupValue(const String& input) {
 
 String lastSetupValue = ""; // Global variable to store the last setup value
 
+// Which source is currently driving the STM32:
+//   true  = a schedule window matches right now (running by SCHEDULE)
+//   false = no schedule matches, so the base SETTING value is in effect
+// Updated every time parseScheduleData() runs.
+bool scheduleActive = false;
+
 // Save setting value to Preferences (NVS - better wear-leveling than EEPROM)
 void saveSettingToStorage(const String& value) {
   if (value.isEmpty()) return;
@@ -246,28 +268,19 @@ String loadSettingFromStorage() {
   return value;
 }
 
-// Apply a share value pushed by the server. lastSetupValue is "*pset@vset#";
-// keep pset (the cap) and replace the value (vset) with the share value,
-// clamped to a max of 4 digits, then write it to the STM32.
-void applyShareValue(int shareWatts) {
+// Build the share output "*pset@value#" from the base setting's cap (pset) and a
+// share value clamped to 4 digits. Returns "" if no base setting is known yet.
+// Does NOT write - applyCurrentValue() decides whether share wins.
+String buildShareValue(int shareWatts) {
   int at = lastSetupValue.indexOf('@');
-  if (lastSetupValue.length() < 2 || lastSetupValue[0] != '*' || at < 1) {
-    DBG_PRINTLN("[SHARE] no setting known yet - ignoring share value");
-    return;
-  }
+  if (lastSetupValue.length() < 2 || lastSetupValue[0] != '*' || at < 1) return "";
 
   int value = shareWatts;
   if (value > 9999) value = 9999;   // max 4 digits
   if (value < 0)    value = 0;
 
-  String pset = lastSetupValue.substring(1, at);          // keep the cap part
-  String out = "*" + pset + "@" + String(value) + "#";    // replace the value
-  lastSetupValue = out;             // remember as the current operational value
-  testSerial.write(out.c_str());    // write to STM32
-  DBG_PRINT("[SHARE] value=");
-  DBG_PRINT(shareWatts);
-  DBG_PRINT(" -> ");
-  DBG_PRINTLN(out);
+  String pset = lastSetupValue.substring(1, at);       // keep the cap part
+  return "*" + pset + "@" + String(value) + "#";
 }
 
 
@@ -359,21 +372,9 @@ bool isTimeInRange(const String& currentTime, const String& startTime, const Str
     return currentMinutes >= startMinutes && currentMinutes <= endMinutes;
 }
 
+// Parse the schedule string into schedules[] (all entries). Does NOT check the
+// time or write anything - applyCurrentValue() evaluates which window matches.
 void parseScheduleData(const String& scheduleData) {
-    // Get current time
-    struct tm timeinfo;
-    if(!getLocalTime(&timeinfo)){
-        // NTP time not available - fallback to stored device setting
-        if (!lastSetupValue.isEmpty()) {
-            testSerial.write(lastSetupValue.c_str());
-        }
-        return;
-    }
-
-    char timeStr[6];
-    strftime(timeStr, sizeof(timeStr), "%H:%M", &timeinfo);
-    String currentTime = String(timeStr);
-
     // Clear old schedule data to avoid stale entries
     for(int i = 0; i < 10; i++) {
         schedules[i].startTime = "";
@@ -382,18 +383,19 @@ void parseScheduleData(const String& scheduleData) {
         schedules[i].outValue = "";
     }
     scheduleCount = 0;
+
+    if (scheduleData.isEmpty() || scheduleData == "null") return;
+
     int startIndex = 0;
     int endIndex = 0;
-    bool foundMatchingSchedule = false;
-    
-    // Loop through the string to find each schedule
-    while (startIndex < scheduleData.length() && scheduleCount < 10 && !foundMatchingSchedule) {
-        // Find the next schedule using # as separator
+
+    // Loop through the string to parse each schedule (# separated).
+    while (startIndex < scheduleData.length() && scheduleCount < 10) {
         endIndex = scheduleData.indexOf('#', startIndex);
         if (endIndex == -1) endIndex = scheduleData.length();
-        
+
         String schedule = scheduleData.substring(startIndex, endIndex);
-        
+
         // Parse start time
         int startPos = schedule.indexOf("start=");
         int endPos = schedule.indexOf("&", startPos);
@@ -416,23 +418,61 @@ void parseScheduleData(const String& scheduleData) {
             schedules[scheduleCount].value = schedule.substring(startPos + 6);
             schedules[scheduleCount].value.trim();
         }
-        
-        
-        // Check if current time is within this schedule
-        if(isTimeInRange(currentTime, schedules[scheduleCount].startTime, schedules[scheduleCount].endTime)) {
-            String valueSetup = convertSetupValue(schedules[scheduleCount].value);
-            testSerial.write(valueSetup.c_str());
-            foundMatchingSchedule = true;
-            break;
-        }
-        
+
         scheduleCount++;
         startIndex = endIndex + 1;
     }
-    
-    // If no matching schedule found, use the stored setup value
-    if(!foundMatchingSchedule && !lastSetupValue.isEmpty()) {
-        testSerial.write(lastSetupValue.c_str());
+}
+
+// Return the converted value ("*pset@vset#") of the schedule window that matches
+// the current time, or "" if none matches (or time not yet available).
+String currentScheduleValue() {
+    if (scheduleCount <= 0) return "";
+    struct tm timeinfo;
+    if (!getLocalTime(&timeinfo, 10)) return "";   // short timeout: never blocks
+    char timeStr[6];
+    strftime(timeStr, sizeof(timeStr), "%H:%M", &timeinfo);
+    String currentTime = String(timeStr);
+
+    for (int i = 0; i < scheduleCount; i++) {
+        if (schedules[i].startTime.isEmpty()) continue;
+        if (isTimeInRange(currentTime, schedules[i].startTime, schedules[i].endTime)) {
+            return convertSetupValue(schedules[i].value);
+        }
+    }
+    return "";
+}
+
+// THE single writer to the STM32. Picks the effective value by priority
+// share > schedule > setting and pushes it, on change plus a keepalive so a
+// rebooted STM32 always re-receives the current value.
+void applyCurrentValue() {
+    String out;
+    bool sched = false;
+
+    // 1. Share (highest) - only while fresh.
+    if (activeShareValue >= 0 && (millis() - activeShareAt) < shareValidMs) {
+        out = buildShareValue(activeShareValue);
+    }
+    // 2. Schedule
+    if (out.isEmpty()) {
+        out = currentScheduleValue();
+        if (!out.isEmpty()) sched = true;
+    }
+    // 3. Base setting
+    if (out.isEmpty()) {
+        out = lastSetupValue;
+    }
+    if (out.isEmpty()) return;   // nothing known yet
+
+    scheduleActive = sched;
+
+    unsigned long now = millis();
+    if (out != lastWrittenValue || now - lastWriteAt >= applyKeepaliveMs) {
+        testSerial.write(out.c_str());
+        lastWrittenValue = out;
+        lastWriteAt = now;
+        DBG_PRINT("[APPLY] "); DBG_PRINTLN(out);
     }
 }
 
@@ -802,13 +842,9 @@ void handleFirmwareUpdate() {
 // Function to get device settings from API
 String getDeviceSettings(const String& deviceUid, const String& deviceSSID) {
   if (WiFi.status() != WL_CONNECTED) {
-    // Load from storage if WiFi not connected
+    // Load from storage if WiFi not connected (applyCurrentValue() writes it).
     if (lastSetupValue.isEmpty()) {
       lastSetupValue = loadSettingFromStorage();
-    }
-    // Send stored value to STM32 even when offline
-    if (!lastSetupValue.isEmpty()) {
-      testSerial.write(lastSetupValue.c_str());
     }
     return "";
   }
@@ -823,8 +859,14 @@ String getDeviceSettings(const String& deviceUid, const String& deviceSSID) {
   int httpResponseCode = http.GET();
   String response = "";
 
+  DBG_PRINT("[SETTING] HTTP code: ");
+  DBG_PRINTLN(httpResponseCode);
+
   if (httpResponseCode > 0) {
     response = http.getString();
+
+    DBG_PRINT("[SETTING] raw response: ");
+    DBG_PRINTLN(response);
 
     if (httpResponseCode == 200) {
       // Parse the JSON response to extract settings
@@ -834,26 +876,32 @@ String getDeviceSettings(const String& deviceUid, const String& deviceSSID) {
       if (!error) {
         // Extract settings values if they exist
         String value = doc["value"].as<String>();
-        DBG_PRINT("Setting value: ");
-        DBG_PRINTLN(value);
         String newSetupValue = convertSetupValue(value);
 
-        // Save to storage only if value has changed
+        DBG_PRINT("[SETTING] value from API: '");
+        DBG_PRINT(value);
+        DBG_PRINT("' -> converted: '");
+        DBG_PRINT(newSetupValue);
+        DBG_PRINTLN("'");
+
+        // Update the cached base setting; applyCurrentValue() pushes it to the
+        // STM32 by priority. No direct write here.
         if (!newSetupValue.isEmpty() && newSetupValue != lastSetupValue) {
           saveSettingToStorage(newSetupValue);
           lastSetupValue = newSetupValue;
+          DBG_PRINTLN("[SETTING] cached (changed) -> applyCurrentValue will push it");
+        } else if (newSetupValue.isEmpty()) {
+          DBG_PRINTLN("[SETTING] REJECTED: value is not 8 digits (HHHHLLLL)");
         }
       } else {
+        DBG_PRINT("[SETTING] JSON parse error: ");
+        DBG_PRINTLN(error.c_str());
       }
     }
   } else {
-    // Server request failed - load from storage as fallback
+    // Server request failed - load from storage as fallback (no direct write).
     if (lastSetupValue.isEmpty()) {
       lastSetupValue = loadSettingFromStorage();
-    }
-    // Send stored value to STM32 when server fails
-    if (!lastSetupValue.isEmpty()) {
-      testSerial.write(lastSetupValue.c_str());
     }
   }
 
@@ -886,11 +934,9 @@ String getScheduleSettings(const String& deviceUid, const String& deviceSSID) {
       DeserializationError error = deserializeJson(doc, response);
       
       if (!error) {
-        // Extract schedule data if it exists
+        // Extract schedule data if it exists (parsed into schedules[]).
         String value = doc["schedule"].as<String>();
-        parseScheduleData(value);        
-      } else {
-        testSerial.write(lastSetupValue.c_str());
+        parseScheduleData(value);
       }
     }
   } else {
@@ -991,7 +1037,10 @@ void setup() {
     DBG_PRINT("Loaded setting from storage: ");
     DBG_PRINTLN(lastSetupValue);
   }
-  http.setReuse(true);
+  // Don't reuse HTTPS connections: polls are ~60s apart, so the server closes
+  // the idle keep-alive connection and reuse then fails with a TLS reset
+  // (ssl_client -76). A fresh connection per request avoids that.
+  http.setReuse(false);
   http.setTimeout(3000);  // 3 second timeout to prevent long blocking
 
   // Initialize MQTT
@@ -1219,9 +1268,17 @@ void loop() {
   }
 
   // Process debounced share value pushed by the server (~every 10s).
+  // Just cache it; applyCurrentValue() decides whether share wins.
   if (sharePending && (currentMillis - shareAt >= cmdDebounce)) {
     sharePending = false;
-    applyShareValue(shareValue);
+    activeShareValue = shareValue;
+    activeShareAt = currentMillis;
+  }
+
+  // Single writer to the STM32: evaluate share > schedule > setting every 1s.
+  if (currentMillis - previousMillisApply >= intervalApply) {
+    previousMillisApply = currentMillis;
+    applyCurrentValue();
   }
 
   // WiFi scan for the setup page. Runs ON DEMAND (page open / refresh) rather
