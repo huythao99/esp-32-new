@@ -4,7 +4,6 @@
 #include "time.h"
 #include <string>
 #include "EEPROM.h"
-#include "SoftwareSerial.h"
 #include <PubSubClient.h>
 #include "mbedtls/md.h"
 #include <ArduinoJson.h>
@@ -45,7 +44,11 @@
 // SHA256 Authentication Key
 #define SHA_SECRET_KEY "K8mN2pQ7vX4bE9fH3gJ6kL1mP5sT8wZ2"
 
-EspSoftwareSerial::UART testSerial;
+// STM32 link over a hardware UART (UART2). Hardware UART is immune to the
+// bit-timing corruption SoftwareSerial suffers while the WiFi radio fires
+// interrupts, so incoming frames no longer arrive garbled. Pins stay RX=13,
+// TX=12 via the ESP32 GPIO matrix, so no wiring change is needed.
+HardwareSerial testSerial(2);
 
 // Preferences instance
 Preferences preferences;
@@ -93,6 +96,17 @@ unsigned long lastWriteAt = 0;
 unsigned long previousMillisApply = 0;
 const long intervalApply = 1000;      // re-evaluate the effective value every 1s
 const long applyKeepaliveMs = 3000;   // re-send the same value at least this often
+
+// STM32 frame reader state. The STM32 streams frames terminated by '*', much
+// faster than the 3s publish cadence. pollStm32() drains the UART every loop
+// iteration into stmFrameBuf, and each time it sees a '*' it validates the
+// completed frame and keeps the newest good one in stmLatestFrame. This keeps
+// reads aligned to frame boundaries (no more spliced/truncated frames) and
+// stops the RX buffer from overflowing with stale frames between publishes.
+#define STM_FIELD_COUNT 10                 // frame = 10 '#'-separated numbers
+String stmFrameBuf = "";                   // bytes of the frame currently arriving
+String stmLatestFrame = "";                // newest fully-received, validated frame
+bool   stmHasNewFrame = false;             // a fresh valid frame arrived since last publish
 
 
 String DEVICES_PATH = "/devices/inverter/";
@@ -991,7 +1005,11 @@ void setup() {
   DBG_PRINT("Firmware Version: ");
   DBG_PRINTLN(currentFirmwareVersion);
 
-  testSerial.begin(9600, EspSoftwareSerial::SWSERIAL_8N1, RX, TX);
+  // Larger RX buffer (~20 frames) so frames aren't lost while loop() is briefly
+  // blocked (HTTP fetch, WiFi scan) and can't drain the UART. Must be set
+  // before begin().
+  testSerial.setRxBufferSize(1024);
+  testSerial.begin(9600, SERIAL_8N1, RX, TX);
   // testSerial.setTimeout(100);
   DBG_PRINT("STM32 Serial: RX=");
   DBG_PRINT(RX);
@@ -1151,7 +1169,66 @@ void setup() {
   server.begin();
 }
 
+// Reject frames that would parse wrong: the STM32 sends exactly
+// STM_FIELD_COUNT numeric fields joined by '#'. Anything with a stray
+// character (bit-noise leftovers, a spliced boundary), the wrong field count,
+// or an EMPTY field is dropped so only clean frames reach the parser / MQTT.
+// The empty-field check matters for truncated frames such as
+// "...#1200.00#1942.56067#" — cut off before the 10th value — which have the
+// right '#' count but a dangling separator and must not be accepted.
+bool isValidStmFrame(const String &f) {
+  if (f.isEmpty()) return false;
+  int fieldCount = 1;                       // N separators => N+1 fields
+  int curFieldLen = 0;                      // chars in the field being scanned
+  for (unsigned int i = 0; i < f.length(); i++) {
+    char c = f[i];
+    if (c == '#') {
+      if (curFieldLen == 0) return false;   // empty field (##, or leading '#')
+      fieldCount++;
+      curFieldLen = 0;
+    } else if (isdigit((unsigned char)c) || c == '.' || c == '-') {
+      curFieldLen++;
+    } else {
+      return false;                         // stray/garbage character
+    }
+  }
+  if (curFieldLen == 0) return false;       // trailing '#': last field is empty
+  return fieldCount == STM_FIELD_COUNT;
+}
+
+// Non-blocking UART drain, called every loop() iteration. Reads only the bytes
+// currently available (never waits on a timeout), assembles them into whole
+// frames on the '*' terminator, and keeps the newest valid frame for the next
+// publish. Draining every iteration keeps the RX buffer from overflowing.
+void pollStm32() {
+  while (testSerial.available() > 0) {
+    char c = (char)testSerial.read();
+    if (c == '*') {                         // end of a frame
+      stmFrameBuf.trim();
+      if (isValidStmFrame(stmFrameBuf)) {
+        stmLatestFrame = stmFrameBuf;
+        stmHasNewFrame = true;
+      } else if (!stmFrameBuf.isEmpty()) {
+        DBG_PRINT("[STM] dropped invalid frame: ");
+        DBG_PRINTLN(stmFrameBuf);
+      }
+      stmFrameBuf = "";
+    } else if (c == '\r' || c == '\n') {
+      // ignore line endings between frames
+    } else {
+      stmFrameBuf += c;
+      // Guard against a missing '*' (e.g. first partial frame after boot):
+      // never let the buffer grow unbounded.
+      if (stmFrameBuf.length() > 200) stmFrameBuf = "";
+    }
+  }
+}
+
 void loop() {
+
+  // Keep the STM32 UART drained on every iteration so frames stay aligned and
+  // the RX buffer never backs up between the 3s publishes below.
+  pollStm32();
 
   unsigned long currentMillis = millis();
 
@@ -1321,33 +1398,21 @@ void loop() {
 
     previousMillis = currentMillis;
 
-    // Debug: Check if data is available from STM32
+    // Use the newest complete, validated frame collected by pollStm32().
+    // No blocking read here and no '*'/substring cleanup needed: the frame is
+    // already delimited and validated (exactly STM_FIELD_COUNT numeric fields).
     DBG_PRINTLN("=== Reading STM32 Data ===");
-    int available = testSerial.available();
-    DBG_PRINT("Bytes available: ");
-    DBG_PRINTLN(available);
 
-    String res = testSerial.readString();
-    // String res = dataExample; // For testing, replace with testSerial.readString();
-    res.trim();
-
-    DBG_PRINT("Raw data: [");
-    DBG_PRINT(res);
-    DBG_PRINTLN("]");
-    DBG_PRINT("Length: ");
-    DBG_PRINTLN(res.length());
-
-    if (res.isEmpty()) {
-      DBG_PRINTLN("No data from STM32");
+    if (!stmHasNewFrame) {
+      DBG_PRINTLN("No new frame from STM32");
       DBG_PRINTLN("=======================");
     } else {
-      int indexOf = res.indexOf("*");
-      DBG_PRINT("Index of '*': ");
-      DBG_PRINTLN(indexOf);
+      stmHasNewFrame = false;              // consume this frame
+      String res = stmLatestFrame;
 
-          res = res.substring(0, indexOf);
-          DBG_PRINT("Data after trim: ");
-          DBG_PRINTLN(res);
+      DBG_PRINT("Frame: [");
+      DBG_PRINT(res);
+      DBG_PRINTLN("]");
 
           String currentUid = getUid();
           
