@@ -97,6 +97,29 @@ def upload_firmware():
     print("[OK] Upload successful\n")
     return True
 
+def commit_and_push(last_ssid):
+    """Commit the SSID bump (and DEBUG change) and push, so the newest SSID
+    number lives on git and the next flash continues from it."""
+    print(f"\n[GIT] Committing and pushing SSID update...")
+
+    subprocess.run(["git", "add", MAIN_CPP_PATH])
+
+    # Nothing staged? Skip (main.cpp unchanged).
+    if subprocess.run(["git", "diff", "--cached", "--quiet"]).returncode == 0:
+        print("[GIT] Nothing to commit (main.cpp unchanged)")
+        return
+
+    if subprocess.run(["git", "commit", "-m",
+                       f"flash: bump SSID to GTIControl{last_ssid}"]).returncode != 0:
+        print("[ERROR] git commit failed")
+        return
+
+    if subprocess.run(["git", "push"]).returncode != 0:
+        print("[ERROR] git push failed (check network / remote / credentials)")
+        return
+
+    print(f"[OK] Pushed SSID GTIControl{last_ssid} to git")
+
 def flash_single_device(device_number, ssid_number):
     """Flash a single device with specific SSID"""
     print(f"\n{'='*50}")
@@ -138,6 +161,9 @@ def main():
     print(f"COMPLETED: Flashed {device_count} device(s)")
     print(f"SSID range: GTIControl{current_number + 1} - GTIControl{current_number + device_count}")
     print(f"{'='*50}")
+
+    # Persist the newest SSID (and DEBUG=0) to git.
+    commit_and_push(current_number + device_count)
 
 if __name__ == "__main__":
     main()
