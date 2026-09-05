@@ -25,7 +25,7 @@
   #define DBG_PRINTLN(...) do {} while (0)
 #endif
 
-#define WIFI_BROADCAST_SSID "GTIControl1252"
+#define WIFI_BROADCAST_SSID "GTIControl1253"
 
 #define KEY_SPLIT "&&&&"
 #define KEY_SPLIT_DATA "#"
