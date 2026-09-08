@@ -103,7 +103,12 @@ const long applyKeepaliveMs = 3000;   // re-send the same value at least this of
 // completed frame and keeps the newest good one in stmLatestFrame. This keeps
 // reads aligned to frame boundaries (no more spliced/truncated frames) and
 // stops the RX buffer from overflowing with stale frames between publishes.
-#define STM_FIELD_COUNT 10                 // frame = 10 '#'-separated numbers
+// Accepted frame width. The STM32 currently sends 10 '#'-separated numbers,
+// but newer firmware versions may append extra fields (e.g. 12). Accept any
+// count in [MIN, MAX] so a wider frame is not dropped as invalid; the parser
+// only reads fields 9 and 10, which exist in every supported width.
+#define STM_FIELD_MIN 10
+#define STM_FIELD_MAX 12
 String stmFrameBuf = "";                   // bytes of the frame currently arriving
 String stmLatestFrame = "";                // newest fully-received, validated frame
 bool   stmHasNewFrame = false;             // a fresh valid frame arrived since last publish
@@ -1169,10 +1174,10 @@ void setup() {
   server.begin();
 }
 
-// Reject frames that would parse wrong: the STM32 sends exactly
-// STM_FIELD_COUNT numeric fields joined by '#'. Anything with a stray
-// character (bit-noise leftovers, a spliced boundary), the wrong field count,
-// or an EMPTY field is dropped so only clean frames reach the parser / MQTT.
+// Reject frames that would parse wrong: the STM32 sends STM_FIELD_MIN..MAX
+// numeric fields joined by '#'. Anything with a stray character (bit-noise
+// leftovers, a spliced boundary), a field count outside that range, or an
+// EMPTY field is dropped so only clean frames reach the parser / MQTT.
 // The empty-field check matters for truncated frames such as
 // "...#1200.00#1942.56067#" — cut off before the 10th value — which have the
 // right '#' count but a dangling separator and must not be accepted.
@@ -1193,7 +1198,7 @@ bool isValidStmFrame(const String &f) {
     }
   }
   if (curFieldLen == 0) return false;       // trailing '#': last field is empty
-  return fieldCount == STM_FIELD_COUNT;
+  return fieldCount >= STM_FIELD_MIN && fieldCount <= STM_FIELD_MAX;
 }
 
 // Non-blocking UART drain, called every loop() iteration. Reads only the bytes
@@ -1400,7 +1405,7 @@ void loop() {
 
     // Use the newest complete, validated frame collected by pollStm32().
     // No blocking read here and no '*'/substring cleanup needed: the frame is
-    // already delimited and validated (exactly STM_FIELD_COUNT numeric fields).
+    // already delimited and validated (STM_FIELD_MIN..MAX numeric fields).
     DBG_PRINTLN("=== Reading STM32 Data ===");
 
     if (!stmHasNewFrame) {
