@@ -1,0 +1,118 @@
+#include "net_mqtt.h"
+#include "shared_state.h"
+#include "config.h"
+#include "storage.h"
+#include "worker.h"
+#include <ArduinoJson.h>
+#include "time.h"
+
+bool connectToMqtt() {
+  lastMqttReconnectAttempt = millis();
+
+  String clientId = "esp32-" + WiFi.macAddress();
+
+  if (mqttClient.connect(clientId.c_str(), MQTT_USERNAME, MQTT_PASSWORD)) {
+    isMqttConnected = true;
+    connectMqtt = 1;
+    mqttFailCount = 0;
+
+    String currentUid = getUid();
+    if (!currentUid.isEmpty()) {
+      MQTT_TOPIC_SETUP        = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/setup/value";
+      MQTT_TOPIC_SCHEDULE     = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/schedule/value";
+      MQTT_TOPIC_DATA         = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/data";
+      MQTT_TOPIC_STATUS       = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/status";
+      MQTT_TOPIC_FIRMWARE     = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/firmware/update";
+      MQTT_TOPIC_OTA_STATUS   = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/ota/status";
+      MQTT_TOPIC_CMD_SETTINGS = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/cmd/settings";
+      MQTT_TOPIC_CMD_SCHEDULE = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/cmd/schedule";
+      MQTT_TOPIC_SHARE        = "inverter/" + currentUid + "/" + wifiBroadcastSSID + "/share";
+
+      // Only subscribe to server->device control topics. Do NOT subscribe to
+      // STATUS / DATA: the device publishes those itself, so subscribing echoes
+      // every message straight back into the callback (self-flood) and the slow
+      // 9600-baud debug prints starve the SoftwareSerial STM32 link.
+      mqttClient.subscribe(MQTT_TOPIC_SETUP.c_str());
+      mqttClient.subscribe(MQTT_TOPIC_SCHEDULE.c_str());
+      mqttClient.subscribe(MQTT_TOPIC_FIRMWARE.c_str());
+      mqttClient.subscribe(MQTT_TOPIC_CMD_SETTINGS.c_str(), 1);  // QoS 1
+      mqttClient.subscribe(MQTT_TOPIC_CMD_SCHEDULE.c_str(), 1);  // QoS 1
+      mqttClient.subscribe(MQTT_TOPIC_SHARE.c_str(), 1);         // QoS 1
+
+      DBG_PRINT("Subscribed cmd/settings: [");
+      DBG_PRINT(MQTT_TOPIC_CMD_SETTINGS);
+      DBG_PRINTLN("]");
+      DBG_PRINT("Subscribed cmd/schedule: [");
+      DBG_PRINT(MQTT_TOPIC_CMD_SCHEDULE);
+      DBG_PRINTLN("]");
+    }
+    return true;
+  }
+
+  isMqttConnected = false;
+  connectMqtt = 0;
+  mqttFailCount++;
+  DBG_PRINT("MQTT connection failed, fail count: ");
+  DBG_PRINTLN(mqttFailCount);
+  return false;
+}
+
+void setupMqttCallback() {
+  mqttClient.setCallback([](char* topic, byte* payload, unsigned int length) {
+    String message = "";
+    for (unsigned int i = 0; i < length; i++) {
+      message += (char)payload[i];
+    }
+
+    String topicStr = String(topic);
+    DBG_PRINTLN("=== MQTT MESSAGE RECEIVED ===");
+    DBG_PRINT("Topic: ");
+    DBG_PRINTLN(topicStr);
+    DBG_PRINT("Message: ");
+    DBG_PRINTLN(message);
+
+    // Firmware update: hand off to Core 0 so the callback returns immediately.
+    if (topicStr == MQTT_TOPIC_FIRMWARE) {
+      otaPending = true;
+    }
+    // Command topics: payload is just "{}" - react to the topic name only.
+    else if (topicStr.endsWith("/cmd/settings")) {
+      cmdSettingsPending = true;
+      cmdSettingsAt = millis();
+    }
+    else if (topicStr.endsWith("/cmd/schedule")) {
+      cmdSchedulePending = true;
+      cmdScheduleAt = millis();
+    }
+    // Share topic: payload is {"value":N}. Parse now, apply from loop().
+    else if (topicStr.endsWith("/share")) {
+      JsonDocument doc;
+      if (deserializeJson(doc, message) == DeserializationError::Ok) {
+        shareValue = doc["value"].as<int>();
+        sharePending = true;
+        shareAt = millis();
+      }
+    }
+  });
+}
+
+void drainOtaStatus() {
+  if (!otaStatusQueue) return;
+  OtaStatusMsg msg;
+  while (xQueueReceive(otaStatusQueue, &msg, 0) == pdTRUE) {
+    if (mqttClient.connected() && !MQTT_TOPIC_OTA_STATUS.isEmpty()) {
+      bool published = mqttClient.publish(MQTT_TOPIC_OTA_STATUS.c_str(), msg.json);
+      DBG_PRINT("MQTT OTA status published: ");
+      DBG_PRINTLN(published ? "Success" : "Failed");
+    }
+  }
+}
+
+void startWiFiReset() {
+  DBG_PRINTLN("=== Resetting WiFi to clear DNS cache (non-blocking) ===");
+  mqttClient.disconnect();
+  WiFi.disconnect(true);       // true = erase credentials from memory
+  WiFi.mode(WIFI_AP_STA);
+  wifiResetPending = true;
+  wifiResetAt = millis();
+}
