@@ -12,7 +12,7 @@ import sys
 import os
 from pathlib import Path
 
-MAIN_CPP_PATH = "src/main.cpp"
+CONFIG_PATH = "src/config.h"
 SSID_PATTERN = r'#define WIFI_BROADCAST_SSID "GTIControl(\d+)"'
 DEBUG_PATTERN = r'#define DEBUG \d+'
 
@@ -45,36 +45,36 @@ if not Path(PIO_PATH).exists() and PIO_PATH != "pio":
     sys.exit(1)
 
 def get_current_ssid_number():
-    """Read current SSID number from main.cpp"""
-    with open(MAIN_CPP_PATH, 'r') as f:
+    """Read current SSID number from config.h"""
+    with open(CONFIG_PATH, 'r') as f:
         content = f.read()
     match = re.search(SSID_PATTERN, content)
     if match:
         return int(match.group(1))
-    raise ValueError("Could not find WIFI_BROADCAST_SSID in main.cpp")
+    raise ValueError("Could not find WIFI_BROADCAST_SSID in config.h")
 
 def set_ssid_number(number):
-    """Update SSID number in main.cpp"""
-    with open(MAIN_CPP_PATH, 'r') as f:
+    """Update SSID number in config.h"""
+    with open(CONFIG_PATH, 'r') as f:
         content = f.read()
     new_content = re.sub(
         SSID_PATTERN,
         f'#define WIFI_BROADCAST_SSID "GTIControl{number}"',
         content
     )
-    with open(MAIN_CPP_PATH, 'w') as f:
+    with open(CONFIG_PATH, 'w') as f:
         f.write(new_content)
     print(f"[OK] SSID set to: GTIControl{number}")
 
 def set_debug(value):
-    """Force the DEBUG flag in main.cpp (0 = production, no serial debug logs)"""
-    with open(MAIN_CPP_PATH, 'r') as f:
+    """Force the DEBUG flag in config.h (0 = production, no serial debug logs)"""
+    with open(CONFIG_PATH, 'r') as f:
         content = f.read()
     new_content, count = re.subn(DEBUG_PATTERN, f'#define DEBUG {value}', content, count=1)
     if count == 0:
-        print("[WARN] Could not find '#define DEBUG' in main.cpp; skipping")
+        print("[WARN] Could not find '#define DEBUG' in config.h; skipping")
         return
-    with open(MAIN_CPP_PATH, 'w') as f:
+    with open(CONFIG_PATH, 'w') as f:
         f.write(new_content)
     print(f"[OK] DEBUG set to: {value}")
 
@@ -102,11 +102,11 @@ def commit_and_push(last_ssid):
     number lives on git and the next flash continues from it."""
     print(f"\n[GIT] Committing and pushing SSID update...")
 
-    subprocess.run(["git", "add", MAIN_CPP_PATH])
+    subprocess.run(["git", "add", CONFIG_PATH])
 
-    # Nothing staged? Skip (main.cpp unchanged).
+    # Nothing staged? Skip (config.h unchanged).
     if subprocess.run(["git", "diff", "--cached", "--quiet"]).returncode == 0:
-        print("[GIT] Nothing to commit (main.cpp unchanged)")
+        print("[GIT] Nothing to commit (config.h unchanged)")
         return
 
     if subprocess.run(["git", "commit", "-m",

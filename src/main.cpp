@@ -294,9 +294,6 @@ void loop() {
       // Fetch immediately (via Core 0) instead of waiting for the 60s timer.
       requestFetchSettings();
       requestFetchSchedule();
-      // Report the running firmware version right away (e.g. right after an OTA
-      // reboot) instead of waiting up to intervalUpdateVersion for the backstop.
-      requestUpdateVersion();
       previousMillisSetting = currentMillis;
       previousMillisSchedule = currentMillis;
       previousMillisUpdateVersion = currentMillis;
@@ -304,10 +301,15 @@ void loop() {
     isStartRegisterDevice = true;
   }
 
-  // Register the device (delegated to Core 0).
+  // Register the device (delegated to Core 0), then report the firmware version.
+  // Order matters on first-ever add: registerDevice() (POST) creates the device,
+  // so it must run before updateFirmwareVersion() (PATCH .../firmware), otherwise
+  // the PATCH 404s on a device that doesn't exist yet. The worker is FIFO, so
+  // enqueuing register first guarantees that order.
   if (isStartRegisterDevice && WiFi.status() == WL_CONNECTED) {
     if (!getUid().isEmpty()) {
       requestRegister();
+      requestUpdateVersion();
     }
     isStartRegisterDevice = false;
   }

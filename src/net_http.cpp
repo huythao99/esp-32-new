@@ -363,7 +363,8 @@ bool registerDevice(const String& deviceId, const String& deviceName, const Stri
   String jsonPayload = "{";
   jsonPayload += "\"deviceId\":\"" + deviceId + "\",";
   jsonPayload += "\"deviceName\":\"" + deviceName + "\",";
-  jsonPayload += "\"userId\":\"" + userId + "\"";
+  jsonPayload += "\"userId\":\"" + userId + "\",";
+  jsonPayload += "\"firmwareVersion\":\"" + currentFirmwareVersion + "\"";
   jsonPayload += "}";
 
   int httpResponseCode = http.POST(jsonPayload);
