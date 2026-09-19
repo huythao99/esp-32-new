@@ -42,7 +42,7 @@ unsigned long previousMillisMqttReconnect = 0;
 unsigned long previousMillisApply = 0;
 unsigned long previousMillisUpdateVersion = 0;
 
-const long interval = 3000;
+const long interval = 1000;  // read STM32 frame + publish every 1s
 const long intervalWifi = 60000;
 const long intervalMqtt = 1000;
 const long intervalMqttReconnect = 10000;
@@ -51,8 +51,13 @@ const long intervalSchedule = 60000;  // slow backstop poll; real-time via cmd/s
 const long intervalApply = 1000;      // re-evaluate the effective value every 1s
 const long intervalUpdateVersion = 30000;  // retry firmware-version report every 30s
 
-long double totalA = 0;
-long double totalA2 = 0;
+// STM32 hardware-serial framing. The UART is drained byte-by-byte every loop()
+// iteration so no message is ever missed; '*' terminates a frame. stmMsgBuffer
+// holds the in-progress frame, stmLatestFrame the most recent complete one that
+// the 1s publish tick will consume.
+static String stmMsgBuffer;
+static String stmLatestFrame;
+static const int STM_FRAME_MAX = 512;  // overflow guard for a runaway/garbled stream
 
 // Setup-page / connection control (Core 1 only)
 bool isStartRegisterDevice = false;
@@ -83,7 +88,10 @@ void setup() {
   DBG_PRINT("Firmware Version: ");
   DBG_PRINTLN(currentFirmwareVersion);
 
-  testSerial.begin(9600, EspSoftwareSerial::SWSERIAL_8N1, STM_RX, STM_TX);
+  // Hardware UART2 for the STM32 link. Enlarge the RX FIFO/ring buffer so bytes
+  // are never dropped even if loop() is briefly busy between drains.
+  testSerial.setRxBufferSize(1024);
+  testSerial.begin(9600, SERIAL_8N1, STM_RX, STM_TX);
   DBG_PRINT("STM32 Serial: RX=");
   DBG_PRINT(STM_RX);
   DBG_PRINT(", TX=");
@@ -205,6 +213,27 @@ void loop() {
   unsigned long currentMillis = millis();
 
   esp_task_wdt_reset();  // feed the watchdog each iteration
+
+  // Drain the STM32 UART every iteration, char by char, so no byte is lost even
+  // if a later part of loop() runs long. A frame ends at '*', a null, or a
+  // newline ('\n'/'\r'); the newest complete frame is stashed in stmLatestFrame
+  // for the 1s publish tick below. (Kept print-free — this is a hot path.)
+  while (testSerial.available()) {
+    char c = (char)testSerial.read();
+    if (c == '*' || c == '\0' || c == '\n' || c == '\r') {
+      if (stmMsgBuffer.length() > 0) {
+        stmLatestFrame = stmMsgBuffer;   // keep only the most recent complete frame
+        DBG_PRINT("[STM32] ");
+        DBG_PRINTLN(stmMsgBuffer);       // print each complete frame as it arrives
+      }
+      stmMsgBuffer = "";
+    } else {
+      stmMsgBuffer += c;
+      if ((int)stmMsgBuffer.length() > STM_FRAME_MAX) {
+        stmMsgBuffer = "";               // garbled/never-terminated stream: resync
+      }
+    }
+  }
 
   // MQTT service + flush any OTA status the worker produced.
   mqttClient.loop();
@@ -390,61 +419,25 @@ void loop() {
     WiFi.scanDelete();
   }
 
-  // Read STM32 data + publish over MQTT (every 3s).
+  // Publish the latest complete STM32 frame over MQTT (every 1s). Frames are
+  // assembled char-by-char by the UART drain at the top of loop().
   if (currentMillis - previousMillis >= interval && isMqttConnected) {
     previousMillis = currentMillis;
 
-    DBG_PRINTLN("=== Reading STM32 Data ===");
-    int available = testSerial.available();
-    DBG_PRINT("Bytes available: ");
-    DBG_PRINTLN(available);
-
-    String res = testSerial.readString();
+    // Consume the most recent complete frame (empty if none arrived this second).
+    String res = stmLatestFrame;
+    stmLatestFrame = "";
     res.trim();
 
-    DBG_PRINT("Raw data: [");
+    DBG_PRINT("STM32 frame: [");
     DBG_PRINT(res);
     DBG_PRINTLN("]");
-    DBG_PRINT("Length: ");
-    DBG_PRINTLN(res.length());
 
     if (res.isEmpty()) {
       DBG_PRINTLN("No data from STM32");
       DBG_PRINTLN("=======================");
     } else {
-      int indexOf = res.indexOf("*");
-      DBG_PRINT("Index of '*': ");
-      DBG_PRINTLN(indexOf);
-
-      res = res.substring(0, indexOf);
-      DBG_PRINT("Data after trim: ");
-      DBG_PRINTLN(res);
-
-      long double pAfter = 0;
-      long double p2After = 0;
-
-      int startIndex = 0;
-      int tokenCount = 0;
-      while (startIndex < (int)res.length()) {
-        int endIndex = res.indexOf('#', startIndex);
-        if (endIndex == -1) endIndex = res.length();
-
-        tokenCount++;
-        String token = res.substring(startIndex, endIndex);
-
-        if (tokenCount == 9) {
-          pAfter = fabs(token.toDouble());
-        } else if (tokenCount == 10) {
-          p2After = fabs(token.toDouble());
-          break;
-        }
-        startIndex = endIndex + 1;
-      }
-
-      totalA = totalA + pAfter / 1000000.0;
-      totalA2 = totalA2 + p2After / 1000000.0;
-
-      String jsonString = "{\"value\":\"" + res + "\",\"totalA2Capacity\":\"" + String((double)totalA2) + "\",\"totalACapacity\":\"" + String((double)totalA) + "\"}";
+      String jsonString = "{\"value\":\"" + res + "\"}";
 
       DBG_PRINTLN("=== Publishing to MQTT ===");
       DBG_PRINT("Topic: ");
